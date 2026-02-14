@@ -213,6 +213,50 @@ class StreamingUIHooks:
             # Clean up tracking
             del self.thinking_blocks[block_index]
 
+        # Display intermediate text blocks (P2 fix)
+        # Only render text that accompanies tool calls (not the final response).
+        # The final response (last block when stop_reason=end_turn) is rendered
+        # by the main response path at full brightness.
+        if block_type == "text" and not is_last_block and block.get("text", "").strip():
+            text = block["text"]
+            indent = "    " if agent_name else ""
+
+            # Render through Rich Console + Markdown for proper line wrapping
+            # (matches the pattern used by thinking blocks above)
+            from io import StringIO
+
+            wrap_width = 52 if agent_name else 60
+            buffer = StringIO()
+            temp_console = Console(file=buffer, highlight=False, width=wrap_width)
+            temp_console.print(Markdown(text))
+            rendered = buffer.getvalue()
+            lines = rendered.rstrip().split("\n")
+            line_count = len(lines)
+
+            # ANSI 256-color escape sequences
+            RESET = "\033[0m"
+
+            if line_count < 3:
+                # Whisper mode: ▸ prefix on first line, 2-space indent on continuation
+                GLYPH_COLOR = "\033[38;5;110m"  # Soft blue for ▸
+                TEXT_COLOR = "\033[38;5;188m"  # Muted warm white for text
+                print(
+                    f"\n{indent}{GLYPH_COLOR}\u25b8{RESET} {TEXT_COLOR}{lines[0]}{RESET}"
+                )
+                for line in lines[1:]:
+                    print(f"{indent}  {TEXT_COLOR}{line}{RESET}")
+                print()  # Blank line after
+            else:
+                # Rail mode: ▍ on every line
+                RAIL_COLOR = "\033[38;5;103m"  # Muted lavender for ▍
+                TEXT_COLOR = "\033[38;5;145m"  # Warm gray for text
+                print()  # Blank line before
+                for line in lines:
+                    print(
+                        f"{indent}{RAIL_COLOR}\u258d{RESET} {TEXT_COLOR}{line}{RESET}"
+                    )
+                print()  # Blank line after
+
         # Display token usage after last block (if present and configured)
         if is_last_block and self.show_token_usage and usage:
             indent = "    " if agent_name else ""
