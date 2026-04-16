@@ -287,8 +287,13 @@ class StreamingUIHooks:
             output_tokens = usage.get("output_tokens", 0)
 
             # Cache metrics (Anthropic splits input into cached/uncached buckets)
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_create = usage.get("cache_creation_input_tokens", 0)
+            # Support both Anthropic-SDK field names and amplifier-core Usage model names
+            cache_read = usage.get("cache_read_input_tokens", 0) or usage.get(
+                "cache_read_tokens", 0
+            )
+            cache_create = usage.get("cache_creation_input_tokens", 0) or usage.get(
+                "cache_write_tokens", 0
+            )
 
             # Compute actual total input (input_tokens alone is misleading with caching)
             # When caching is active, input_tokens is just the uncacheable portion
