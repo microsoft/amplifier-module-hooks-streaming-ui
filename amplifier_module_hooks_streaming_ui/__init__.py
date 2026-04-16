@@ -282,17 +282,21 @@ class StreamingUIHooks:
         if is_last_block and self.show_token_usage and usage:
             indent = "    " if agent_name else ""
 
-            # Get raw token counts
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
+            # Get raw token counts (guard against None values from model_dump())
+            input_tokens = usage.get("input_tokens") or 0
+            output_tokens = usage.get("output_tokens") or 0
 
             # Cache metrics (Anthropic splits input into cached/uncached buckets)
             # Support both Anthropic-SDK field names and amplifier-core Usage model names
-            cache_read = usage.get("cache_read_input_tokens", 0) or usage.get(
-                "cache_read_tokens", 0
+            cache_read = (
+                usage.get("cache_read_input_tokens")
+                or usage.get("cache_read_tokens")
+                or 0
             )
-            cache_create = usage.get("cache_creation_input_tokens", 0) or usage.get(
-                "cache_write_tokens", 0
+            cache_create = (
+                usage.get("cache_creation_input_tokens")
+                or usage.get("cache_write_tokens")
+                or 0
             )
 
             # Compute actual total input (input_tokens alone is misleading with caching)
