@@ -142,8 +142,8 @@ async def test_mount_with_defaults():
 
     await mount(coordinator, config)
 
-    # Should register 5 hooks: content_block:start, content_block:end, tool:pre, tool:post, llm:response
-    assert coordinator.hooks.register.call_count == 5
+    # Should register 6 hooks: content_block:start, content_block:end, tool:pre, tool:post, llm:response, orchestrator:complete
+    assert coordinator.hooks.register.call_count == 6
 
 
 class TestStreamingUIHooks:
