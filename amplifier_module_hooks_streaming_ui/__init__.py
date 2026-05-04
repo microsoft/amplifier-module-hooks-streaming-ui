@@ -8,7 +8,6 @@ __amplifier_module_type__ = "hook"
 
 import logging
 import sys
-from decimal import Decimal
 from typing import Any
 
 from amplifier_core.models import HookResult
@@ -40,10 +39,6 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     coordinator.hooks.register("tool:pre", hooks.handle_tool_pre)
     coordinator.hooks.register("tool:post", hooks.handle_tool_post)
     coordinator.hooks.register("llm:response", hooks.handle_llm_response)
-    coordinator.hooks.register(
-        "orchestrator:complete", hooks.handle_orchestrator_complete
-    )
-
     # Log successful mount
     logger.info("Mounted hooks-streaming-ui")
 
@@ -69,89 +64,30 @@ class StreamingUIHooks:
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
 
-        # Last agent name seen (used for indent in orchestrator:complete)
-        self._last_agent: str | None = None
-
-        # Turn accumulators (reset on orchestrator:complete)
-        self._turn_input = 0
-        self._turn_output = 0
-        self._turn_cache_read = 0
-        self._turn_total = 0
-        self._turn_cost: Decimal | None = None
-
-        # Session accumulators (never reset)
-        self._session_input = 0
-        self._session_output = 0
-        self._session_cache_read = 0
-        self._session_total = 0
-        self._session_cost: Decimal | None = None
-
-    # ── Accumulator helpers ────────────────────────────────────────────────
-
-    def _turn_cache_info(self) -> str:
-        """Build cache info string for turn totals."""
-        if self._turn_cache_read <= 0:
-            return ""
-        cache_pct = (
-            int((self._turn_cache_read / self._turn_input) * 100)
-            if self._turn_input > 0
-            else 0
-        )
-        return f" ({cache_pct}% cached)"
-
-    def _turn_cost_str(self) -> str:
-        """Build cost string for turn totals."""
-        if self._turn_cost is None:
-            return ""
-        return f" | Cost: ${float(self._turn_cost):.4f}"
-
-    def _session_cache_info(self) -> str:
-        """Build cache info string for session totals."""
-        if self._session_cache_read <= 0:
-            return ""
-        cache_pct = (
-            int((self._session_cache_read / self._session_input) * 100)
-            if self._session_input > 0
-            else 0
-        )
-        return f" ({cache_pct}% cached)"
-
-    def _session_cost_str(self) -> str:
-        """Build cost string for session totals."""
-        if self._session_cost is None:
-            return ""
-        return f" | Cost: ${float(self._session_cost):.4f}"
-
-    def _reset_turn(self) -> None:
-        """Reset per-turn accumulators."""
-        self._turn_input = 0
-        self._turn_output = 0
-        self._turn_cache_read = 0
-        self._turn_total = 0
-        self._turn_cost = None
-
     # ── Formula helper ─────────────────────────────────────────────────────
 
     def _compute_total_input(self, usage: dict) -> int:
-        """Compute total input tokens.
+        """Compute gross total input tokens.
 
-        input_tokens is the gross total for all providers:
-        cache_read tokens are already counted inside input_tokens,
-        so we only add cache_create (cache_write) on top.
+        All providers report input_tokens as the gross total —
+        fresh tokens plus any tokens read from the prompt cache.
+        cache_read is already counted inside input_tokens, so adding
+        it again would double-count. cache_write_tokens is the
+        exception: cache creation cost is billed on top of gross
+        and is NOT included in input_tokens.
 
         Args:
-            usage: Usage dict from the LLM response
+            usage: Usage dict from the event
 
         Returns:
-            Total input token count
+            Gross total input token count
         """
         input_tokens = usage.get("input_tokens") or 0
         cache_create = (
-            usage.get("cache_creation_input_tokens")
-            or usage.get("cache_write_tokens")
+            usage.get("cache_write_tokens")
+            or usage.get("cache_creation_input_tokens")
             or 0
         )
-        # cache_read already inside input_tokens for all providers
         return input_tokens + cache_create
 
     # ── Hook handlers ──────────────────────────────────────────────────────
@@ -410,12 +346,6 @@ class StreamingUIHooks:
                     # First request - cache being created
                     cache_info = " (caching...)"
 
-            # Cost display (shows nothing until cost_usd is provided)
-            cost_usd = usage.get("cost_usd")
-            cost_str = (
-                f" | Cost: ${float(cost_usd):.4f}" if cost_usd is not None else ""
-            )
-
             # Build the header with model info if available
             if self.last_llm_info:
                 provider = self.last_llm_info.get("provider") or ""
@@ -431,59 +361,11 @@ class StreamingUIHooks:
 
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
-                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_str}\033[0m"
+                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}\033[0m"
             )
             # Clear for next request to avoid stale data
             self.last_llm_info = None
 
-            # Feed turn + session accumulators
-            self._turn_input += total_input
-            self._turn_output += output_tokens
-            self._turn_cache_read += cache_read
-            self._turn_total += total_tokens
-            self._session_input += total_input
-            self._session_output += output_tokens
-            self._session_cache_read += cache_read
-            self._session_total += total_tokens
-            if cost_usd is not None:
-                cost_decimal = Decimal(str(cost_usd))
-                self._turn_cost = (self._turn_cost or Decimal(0)) + cost_decimal
-                self._session_cost = (self._session_cost or Decimal(0)) + cost_decimal
-
-            # Track last agent for orchestrator:complete indent
-            self._last_agent = agent_name
-
-        return HookResult(action="continue")
-
-    async def handle_orchestrator_complete(self, _event: str, data: dict) -> HookResult:
-        """Display per-turn and session token usage summaries.
-
-        Args:
-            _event: Event name (orchestrator:complete) - unused
-            data: Event data - unused
-
-        Returns:
-            HookResult with action="continue"
-        """
-        if not self.show_token_usage:
-            return HookResult(action="continue")
-
-        indent = "    " if self._last_agent else ""
-        # Emit turn header + double-stroke line
-        print(f"{indent}\033[2m│  📊 Turn Token Usage\033[0m")
-        print(
-            f"{indent}\033[2m╘═ Input: {self._turn_input:,}{self._turn_cache_info()} | Output: {self._turn_output:,} | Total: {self._turn_total:,}{self._turn_cost_str()}\033[0m"
-        )
-
-        # Emit session status bar (muted blue, always above prompt)
-        SES = "\033[38;5;67m"
-        R = "\033[0m"
-        print(
-            f"{SES}Σ  Input: {self._session_input:,}{self._session_cache_info()} | Output: {self._session_output:,} | Total: {self._session_total:,}{self._session_cost_str()}{R}"
-        )
-
-        # Reset turn accumulators
-        self._reset_turn()
         return HookResult(action="continue")
 
     async def handle_tool_pre(self, _event: str, data: dict[str, Any]) -> HookResult:
