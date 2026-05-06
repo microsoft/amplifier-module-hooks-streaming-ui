@@ -108,3 +108,23 @@ async def test_orchestrator_complete_shows_question_mark_for_unknown_model(capsy
 
     assert "Turn: ?" in captured.out
     assert "Session: ?" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_mount_registers_orchestrator_complete_handler():
+    """mount() registers a handler for orchestrator:complete."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=[])
+    registered_hooks = {}
+
+    def capture_hook(event, handler, **kwargs):
+        registered_hooks[event] = handler
+
+    coordinator.hooks.register = capture_hook
+    coordinator.mount = AsyncMock()
+
+    from amplifier_module_hooks_streaming_ui import mount
+
+    await mount(coordinator, config={})
+
+    assert "orchestrator:complete" in registered_hooks
