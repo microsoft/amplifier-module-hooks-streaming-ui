@@ -1,6 +1,10 @@
 """Tests for cost display formatting in hooks-streaming-ui."""
 
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from amplifier_core.models import HookResult
 
 from amplifier_module_hooks_streaming_ui import _sum_cost_usd, format_cost_usd
 
@@ -39,3 +43,68 @@ class TestSumCostUsd:
     def test_mixed_none_and_values(self):
         contributions = [{"cost_usd": Decimal("0.03")}, {"cost_usd": None}]
         assert _sum_cost_usd(contributions) == Decimal("0.03")
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_prints_cost_line(capsys):
+    """On orchestrator:complete, hook prints the 💰 line with turn and session cost."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.09")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, _ = _make_cost_handler(coordinator)
+
+    result = await handler("orchestrator:complete", {})
+
+    captured = capsys.readouterr()
+    assert "💰" in captured.out
+    assert "$0.09" in captured.out  # both turn and session are $0.09 on first turn
+    assert isinstance(result, HookResult)
+    assert result.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_computes_turn_delta(capsys):
+    """Turn cost is the delta since the last orchestrator:complete."""
+    coordinator = MagicMock()
+    # First turn: $0.09 session total
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.09")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, _ = _make_cost_handler(coordinator)
+
+    await handler("orchestrator:complete", {})
+    capsys.readouterr()  # discard first turn output
+
+    # Second turn: $0.18 session total → turn cost = $0.09
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.18")}]
+    )
+    await handler("orchestrator:complete", {})
+    captured = capsys.readouterr()
+
+    assert "Turn: $0.09" in captured.out
+    assert "Session: $0.18" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_shows_question_mark_for_unknown_model(capsys):
+    """When no cost data, displays ? for both turn and session."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=[])
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, _ = _make_cost_handler(coordinator)
+
+    await handler("orchestrator:complete", {})
+    captured = capsys.readouterr()
+
+    assert "Turn: ?" in captured.out
+    assert "Session: ?" in captured.out

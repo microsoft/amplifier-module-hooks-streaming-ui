@@ -687,4 +687,40 @@ def _sum_cost_usd(contributions: list) -> Decimal | None:
     return total
 
 
-__all__ = ["mount", "StreamingUIHooks", "format_cost_usd", "_sum_cost_usd"]
+def _make_cost_handler(coordinator):
+    """Create the orchestrator:complete handler and its state.
+
+    Returns (handler_coroutine, state_dict) so tests can inspect state.
+    The state dict has key 'prev_total'.
+    """
+    state: dict[str, Decimal | None] = {"prev_total": None}
+
+    async def _on_orchestrator_complete(event: str, data: dict):
+        contributions = await coordinator.collect_contributions("session.cost")
+        session_total = _sum_cost_usd(contributions)
+
+        prev = state["prev_total"]
+        if session_total is not None and prev is not None:
+            turn_cost = session_total - prev
+        else:
+            turn_cost = session_total  # first turn: turn cost = session total so far
+
+        state["prev_total"] = session_total
+
+        turn_str = format_cost_usd(turn_cost)
+        session_str = format_cost_usd(session_total)
+
+        print(f"\033[2m💰 Turn: {turn_str} | Session: {session_str}\033[0m", flush=True)
+
+        return HookResult(action="continue")
+
+    return _on_orchestrator_complete, state
+
+
+__all__ = [
+    "mount",
+    "StreamingUIHooks",
+    "format_cost_usd",
+    "_sum_cost_usd",
+    "_make_cost_handler",
+]
