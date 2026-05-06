@@ -39,7 +39,6 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     coordinator.hooks.register("tool:pre", hooks.handle_tool_pre)
     coordinator.hooks.register("tool:post", hooks.handle_tool_post)
     coordinator.hooks.register("llm:response", hooks.handle_llm_response)
-
     # Log successful mount
     logger.info("Mounted hooks-streaming-ui")
 
@@ -64,6 +63,34 @@ class StreamingUIHooks:
         self.show_token_usage = show_token_usage
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
+
+    # ── Formula helper ─────────────────────────────────────────────────────
+
+    def _compute_total_input(self, usage: dict) -> int:
+        """Compute gross total input tokens.
+
+        All providers report input_tokens as the gross total —
+        fresh tokens plus any tokens read from the prompt cache.
+        cache_read is already counted inside input_tokens, so adding
+        it again would double-count. cache_write_tokens is the
+        exception: cache creation cost is billed on top of gross
+        and is NOT included in input_tokens.
+
+        Args:
+            usage: Usage dict from the event
+
+        Returns:
+            Gross total input token count
+        """
+        input_tokens = usage.get("input_tokens") or 0
+        cache_create = (
+            usage.get("cache_write_tokens")
+            or usage.get("cache_creation_input_tokens")
+            or 0
+        )
+        return input_tokens + cache_create
+
+    # ── Hook handlers ──────────────────────────────────────────────────────
 
     async def handle_llm_response(
         self, _event: str, data: dict[str, Any]
@@ -283,7 +310,6 @@ class StreamingUIHooks:
             indent = "    " if agent_name else ""
 
             # Get raw token counts (guard against None values from model_dump())
-            input_tokens = usage.get("input_tokens") or 0
             output_tokens = usage.get("output_tokens") or 0
 
             # Cache metrics (Anthropic splits input into cached/uncached buckets)
@@ -293,15 +319,9 @@ class StreamingUIHooks:
                 or usage.get("cache_read_tokens")
                 or 0
             )
-            cache_create = (
-                usage.get("cache_creation_input_tokens")
-                or usage.get("cache_write_tokens")
-                or 0
-            )
 
-            # Compute actual total input (input_tokens alone is misleading with caching)
-            # When caching is active, input_tokens is just the uncacheable portion
-            total_input = input_tokens + cache_read + cache_create
+            # Compute actual total input using helper (fixes double-count bug)
+            total_input = self._compute_total_input(usage)
             total_tokens = total_input + output_tokens
 
             # Format numbers with thousands separators
@@ -311,13 +331,18 @@ class StreamingUIHooks:
 
             # Build cache info string if caching is active
             cache_info = ""
-            if cache_read > 0 or cache_create > 0:
+            if cache_read > 0:
                 cache_pct = (
                     int((cache_read / total_input) * 100) if total_input > 0 else 0
                 )
-                if cache_read > 0:
-                    cache_info = f" ({cache_pct}% cached)"
-                else:
+                cache_info = f" ({cache_pct}% cached)"
+            else:
+                cache_create = (
+                    usage.get("cache_creation_input_tokens")
+                    or usage.get("cache_write_tokens")
+                    or 0
+                )
+                if cache_create > 0:
                     # First request - cache being created
                     cache_info = " (caching...)"
 

@@ -707,3 +707,5 @@ class TestTokenUsageHeaderWithModelInfo:
             "last_llm_info should be cleared after token usage is rendered "
             "to avoid stale data in subsequent requests"
         )
+
+
