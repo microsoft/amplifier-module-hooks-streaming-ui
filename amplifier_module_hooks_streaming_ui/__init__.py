@@ -7,7 +7,9 @@ Display streaming LLM output (thinking blocks, tool calls, and token usage) to c
 __amplifier_module_type__ = "hook"
 
 import logging
+import math
 import sys
+from decimal import Decimal
 from typing import Any
 
 from amplifier_core.models import HookResult
@@ -649,4 +651,40 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
     return "\n".join(fragment for fragment in fragments if fragment)
 
 
-__all__ = ["mount", "StreamingUIHooks"]
+def format_cost_usd(cost: Decimal | None) -> str:
+    """Format cost for terminal display.
+
+    None  → "?"       (no rate data — never show $0.00 for unknown)
+    0     → "$0.00"   (known-free)
+    ≥0.01 → "$X.XX"
+    <0.01 → 2 significant figures, e.g. "$0.0043"
+    """
+    if cost is None:
+        return "?"
+    if cost == Decimal("0"):
+        return "$0.00"
+    if cost >= Decimal("0.01"):
+        return f"${cost:.2f}"
+    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -4 for 0.0001, -3 for 0.0043
+    input_exp = -cost.as_tuple().exponent  # exponent of the input Decimal
+    decimal_places = max(-exp_floor, input_exp)
+    return f"${cost:.{decimal_places}f}"
+
+
+# Intentionally duplicated across provider-anthropic, foundation, and hooks-streaming-ui.
+# These are separate repos with no shared utility dependency. The function is 10 lines —
+# the coordination cost of sharing outweighs the duplication cost.
+def _sum_cost_usd(contributions: list) -> Decimal | None:
+    """Sum cost_usd from collect_contributions("session.cost") results."""
+    total: Decimal | None = None
+    for c in contributions:
+        if c and isinstance(c, dict):
+            cost = c.get("cost_usd")
+            if cost is not None:
+                total = (total or Decimal("0")) + (
+                    cost if isinstance(cost, Decimal) else Decimal(str(cost))
+                )
+    return total
+
+
+__all__ = ["mount", "StreamingUIHooks", "format_cost_usd", "_sum_cost_usd"]
