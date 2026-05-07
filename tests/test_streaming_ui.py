@@ -146,6 +146,31 @@ async def test_mount_with_defaults():
     assert coordinator.hooks.register.call_count == 6
 
 
+@pytest.mark.asyncio
+async def test_mount_with_token_usage_disabled_skips_cost_handler():
+    """When show_token_usage=False, orchestrator:complete is not registered.
+
+    Users who disable token usage display should not see the cost footer either.
+    The per-call cost line and the 💰 turn/session footer are gated together.
+    """
+    coordinator = MagicMock()
+    coordinator.hooks = MagicMock()
+    coordinator.hooks.register = MagicMock()
+
+    config = {"ui": {"show_token_usage": False}}
+
+    await mount(coordinator, config)
+
+    # Only 5 hooks: content_block:start, content_block:end, tool:pre, tool:post, llm:response
+    # orchestrator:complete is NOT registered when show_token_usage=False
+    assert coordinator.hooks.register.call_count == 5
+
+    registered_events = [
+        call[0][0] for call in coordinator.hooks.register.call_args_list
+    ]
+    assert "orchestrator:complete" not in registered_events
+
+
 class TestStreamingUIHooks:
     """Test the StreamingUIHooks class."""
 
@@ -709,8 +734,8 @@ class TestTokenUsageHeaderWithModelInfo:
         )
 
 
-
 # ─── Per-call cost display on Token Usage line ───────────────────────────────
+
 
 class TestTokenUsageCostDisplay:
     """Test that per-call cost_usd from M2 providers appears on the Token Usage line."""
@@ -737,7 +762,9 @@ class TestTokenUsageCostDisplay:
 
         captured = capsys.readouterr()
         assert "Cost:" in captured.out, "Cost field missing from Token Usage line"
-        assert "$0.0043" in captured.out, f"Expected $0.0043 in output, got: {captured.out}"
+        assert "$0.0043" in captured.out, (
+            f"Expected $0.0043 in output, got: {captured.out}"
+        )
         # Full expected format check
         assert "Input: 1,000" in captured.out
         assert "Output: 500" in captured.out
