@@ -363,9 +363,17 @@ class StreamingUIHooks:
             else:
                 header = "📊 Token Usage"
 
+            # Format per-call cost if available (cost_usd is str from M2 provider stamping)
+            cost_raw = usage.get("cost_usd")
+            cost_part = (
+                f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
+                if cost_raw is not None
+                else ""
+            )
+
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
-                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}\033[0m"
+                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
             )
             # Clear for next request to avoid stale data
             self.last_llm_info = None
