@@ -128,3 +128,102 @@ async def test_mount_registers_orchestrator_complete_handler():
     await mount(coordinator, config={})
 
     assert "orchestrator:complete" in registered_hooks
+
+
+# ---------------------------------------------------------------------------
+# Tests for the session cost accumulator — the unconditional llm:response
+# hook that owns session.cost contributions (previously lived in providers).
+# ---------------------------------------------------------------------------
+
+
+class TestSessionCostAccumulator:
+    """mount() registers an unconditional llm:response accumulator on session.cost."""
+
+    def _make_coordinator(self):
+        """Return a mock coordinator that captures hooks and contributors."""
+        coordinator = MagicMock()
+        coordinator.collect_contributions = AsyncMock(return_value=[])
+
+        registered_hooks: dict = {}
+        registered_contributors: dict = {}
+
+        def capture_hook(event, handler, **kwargs):
+            registered_hooks.setdefault(event, []).append(handler)
+
+        def capture_contributor(channel, name, callback):
+            registered_contributors[(channel, name)] = callback
+
+        coordinator.hooks.register = capture_hook
+        coordinator.register_contributor = capture_contributor
+
+        return coordinator, registered_hooks, registered_contributors
+
+    @pytest.mark.asyncio
+    async def test_accumulator_registered_unconditionally(self):
+        """session.cost contributor is registered regardless of show_token_usage."""
+        from amplifier_module_hooks_streaming_ui import mount
+
+        for show in (True, False):
+            coordinator, _, contributors = self._make_coordinator()
+            await mount(coordinator, config={"ui": {"show_token_usage": show}})
+            assert ("session.cost", "streaming-ui-cost-accumulator") in contributors, (
+                f"session.cost contributor missing when show_token_usage={show}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_accumulator_returns_none_before_any_events(self):
+        """Contributor returns None (not $0) before any llm:response events."""
+        from amplifier_module_hooks_streaming_ui import mount
+
+        coordinator, _, contributors = self._make_coordinator()
+        await mount(coordinator, config={})
+
+        callback = contributors[("session.cost", "streaming-ui-cost-accumulator")]
+        assert callback() is None
+
+    @pytest.mark.asyncio
+    async def test_accumulator_sums_cost_across_events(self):
+        """Accumulator adds cost_usd from successive llm:response events."""
+        from amplifier_module_hooks_streaming_ui import mount
+
+        coordinator, hooks, contributors = self._make_coordinator()
+        await mount(coordinator, config={})
+
+        # Drive all registered llm:response handlers (display + accumulator)
+        accumulators = [
+            h
+            for h in hooks.get("llm:response", [])
+            if h.__name__ == "_accumulate_session_cost"
+        ]
+        assert len(accumulators) == 1, (
+            "Expected exactly one _accumulate_session_cost handler"
+        )
+        accumulate = accumulators[0]
+
+        await accumulate("llm:response", {"usage": {"cost_usd": Decimal("0.05")}})
+        await accumulate("llm:response", {"usage": {"cost_usd": Decimal("0.03")}})
+
+        callback = contributors[("session.cost", "streaming-ui-cost-accumulator")]
+        result = callback()
+        assert result == {"cost_usd": Decimal("0.08")}
+        assert isinstance(result["cost_usd"], Decimal)
+
+    @pytest.mark.asyncio
+    async def test_accumulator_ignores_none_cost(self):
+        """Events with cost_usd=None leave the contributor returning None."""
+        from amplifier_module_hooks_streaming_ui import mount
+
+        coordinator, hooks, contributors = self._make_coordinator()
+        await mount(coordinator, config={})
+
+        accumulators = [
+            h
+            for h in hooks.get("llm:response", [])
+            if h.__name__ == "_accumulate_session_cost"
+        ]
+        accumulate = accumulators[0]
+
+        await accumulate("llm:response", {"usage": {"cost_usd": None}})
+
+        callback = contributors[("session.cost", "streaming-ui-cost-accumulator")]
+        assert callback() is None
