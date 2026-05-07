@@ -363,9 +363,9 @@ class StreamingUIHooks:
             else:
                 header = "📊 Token Usage"
 
-            # cost_usd arrives as str — providers explicitly str() the Decimal before
-            # emitting the llm:response event. (The Pydantic Usage field is Decimal;
-            # the event channel carries str by convention.)
+            # cost_usd may arrive as Decimal (from Pydantic model fields) or str
+            # (from providers that serialize before emitting). Decimal(str(cost_raw))
+            # handles both safely.
             cost_raw = usage.get("cost_usd")
             cost_part = ""
             if cost_raw is not None:
@@ -687,7 +687,7 @@ def format_cost_usd(cost: Decimal | None) -> str:
 
 
 # Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
-# so this cannot be imported from amplifier_foundation.bundle._prepared.
+# so this cannot be imported from amplifier_foundation (public: sum_cost_usd).
 # Keep in sync with the canonical version there: if you fix a bug here, fix it there too.
 def _sum_cost_usd(contributions: list) -> Decimal | None:
     """Sum cost_usd from collect_contributions("session.cost") results.
