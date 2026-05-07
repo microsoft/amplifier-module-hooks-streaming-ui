@@ -363,13 +363,16 @@ class StreamingUIHooks:
             else:
                 header = "📊 Token Usage"
 
-            # Format per-call cost if available (cost_usd is str from M2 provider stamping)
+            # cost_usd arrives as str — providers explicitly str() the Decimal before
+            # emitting the llm:response event. (The Pydantic Usage field is Decimal;
+            # the event channel carries str by convention.)
             cost_raw = usage.get("cost_usd")
-            cost_part = (
-                f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
-                if cost_raw is not None
-                else ""
-            )
+            cost_part = ""
+            if cost_raw is not None:
+                try:
+                    cost_part = f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
+                except Exception:
+                    cost_part = " | Cost: ?"
 
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
@@ -683,10 +686,16 @@ def format_cost_usd(cost: Decimal | None) -> str:
     return f"${cost:.{decimal_places}f}"
 
 
-# Collects cost_usd contributions from a session.cost channel and returns the
-# total as Decimal, or None when no cost data is present (e.g. self-hosted models).
+# Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
+# so this cannot be imported from amplifier_foundation.bundle._prepared.
+# Keep in sync with the canonical version there: if you fix a bug here, fix it there too.
 def _sum_cost_usd(contributions: list) -> Decimal | None:
-    """Sum cost_usd from collect_contributions("session.cost") results."""
+    """Sum cost_usd from collect_contributions("session.cost") results.
+
+    Returns None if no cost data is present. None != Decimal("0"):
+    None means unknown (no rate data); 0 means known-free.
+    Silently skips malformed values rather than raising.
+    """
     total: Decimal | None = None
     for c in contributions:
         if c and isinstance(c, dict):
