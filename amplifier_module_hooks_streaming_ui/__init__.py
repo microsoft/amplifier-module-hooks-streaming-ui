@@ -673,6 +673,8 @@ def format_cost_usd(cost: Decimal | None) -> str:
         return "?"
     if cost == Decimal("0"):
         return "$0.00"
+    if cost < Decimal("0"):
+        return "?"  # edge case: negative delta from contribution accounting
     if cost >= Decimal("0.01"):
         return f"${cost:.2f}"
     exp_floor = math.floor(math.log10(float(cost)))  # e.g. -4 for 0.0001, -3 for 0.0043
@@ -690,9 +692,13 @@ def _sum_cost_usd(contributions: list) -> Decimal | None:
         if c and isinstance(c, dict):
             cost = c.get("cost_usd")
             if cost is not None:
-                total = (total or Decimal("0")) + (
-                    cost if isinstance(cost, Decimal) else Decimal(str(cost))
-                )
+                if isinstance(cost, Decimal):
+                    total = (total or Decimal("0")) + cost
+                else:
+                    try:
+                        total = (total or Decimal("0")) + Decimal(str(cost))
+                    except Exception:
+                        pass  # malformed cost_usd value; skip and degrade gracefully
     return total
 
 
@@ -730,6 +736,4 @@ __all__ = [
     "mount",
     "StreamingUIHooks",
     "format_cost_usd",
-    "_sum_cost_usd",
-    "_make_cost_handler",
 ]
