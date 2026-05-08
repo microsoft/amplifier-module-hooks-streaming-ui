@@ -7,7 +7,9 @@ Display streaming LLM output (thinking blocks, tool calls, and token usage) to c
 __amplifier_module_type__ = "hook"
 
 import logging
+import math
 import sys
+from decimal import Decimal
 from typing import Any
 
 from amplifier_core.models import HookResult
@@ -39,6 +41,9 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     coordinator.hooks.register("tool:pre", hooks.handle_tool_pre)
     coordinator.hooks.register("tool:post", hooks.handle_tool_post)
     coordinator.hooks.register("llm:response", hooks.handle_llm_response)
+    if show_token_usage:
+        _cost_handler, _ = _make_cost_handler(coordinator)
+        coordinator.hooks.register("orchestrator:complete", _cost_handler)
     # Log successful mount
     logger.info("Mounted hooks-streaming-ui")
 
@@ -359,9 +364,20 @@ class StreamingUIHooks:
             else:
                 header = "📊 Token Usage"
 
+            # cost_usd may arrive as Decimal (from Pydantic model fields) or str
+            # (from providers that serialize before emitting). Decimal(str(cost_raw))
+            # handles both safely.
+            cost_raw = usage.get("cost_usd")
+            cost_part = ""
+            if cost_raw is not None:
+                try:
+                    cost_part = f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
+                except Exception:
+                    cost_part = " | Cost: ?"
+
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
-                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}\033[0m"
+                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
             )
             # Clear for next request to avoid stale data
             self.last_llm_info = None
@@ -649,4 +665,89 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
     return "\n".join(fragment for fragment in fragments if fragment)
 
 
-__all__ = ["mount", "StreamingUIHooks"]
+def format_cost_usd(cost: Decimal | None) -> str:
+    """Format cost for terminal display.
+
+    None  → "?"       (no rate data — never show $0.00 for unknown)
+    0     → "$0.00"   (known-free)
+    ≥0.01 → "$X.XX"
+    <0.01 → 2 significant figures, e.g. "$0.0043"
+    """
+    if cost is None:
+        return "?"
+    if cost == Decimal("0"):
+        return "$0.00"
+    if cost < Decimal("0"):
+        return "?"  # edge case: negative delta from contribution accounting
+    if cost >= Decimal("0.01"):
+        return f"${cost:.2f}"
+    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -4 for 0.0001, -3 for 0.0043
+    input_exp = -cost.as_tuple().exponent  # exponent of the input Decimal
+    decimal_places = max(-exp_floor, input_exp)
+    return f"${cost:.{decimal_places}f}"
+
+
+# Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
+# so this cannot be imported from amplifier_foundation (public: sum_cost_usd).
+# Keep in sync with the canonical version there: if you fix a bug here, fix it there too.
+def _sum_cost_usd(contributions: list) -> Decimal | None:
+    """Sum cost_usd from collect_contributions("session.cost") results.
+
+    Returns None if no cost data is present. None != Decimal("0"):
+    None means unknown (no rate data); 0 means known-free.
+    Silently skips malformed values rather than raising.
+    """
+    total: Decimal | None = None
+    for c in contributions:
+        if c and isinstance(c, dict):
+            cost = c.get("cost_usd")
+            if cost is not None:
+                if isinstance(cost, Decimal):
+                    total = (total or Decimal("0")) + cost
+                else:
+                    try:
+                        total = (total or Decimal("0")) + Decimal(str(cost))
+                    except Exception:
+                        pass  # malformed cost_usd value; skip and degrade gracefully
+    return total
+
+
+def _make_cost_handler(coordinator):
+    """Create the orchestrator:complete handler and its state.
+
+    Returns (handler_coroutine, state_dict) so tests can inspect state.
+    The state dict has key 'prev_total'.
+    """
+    state: dict[str, Decimal | None] = {"prev_total": None}
+
+    async def _on_orchestrator_complete(event: str, data: dict):
+        try:
+            contributions = await coordinator.collect_contributions("session.cost")
+            session_total = _sum_cost_usd(contributions)
+
+            prev = state["prev_total"]
+            if session_total is not None and prev is not None:
+                turn_cost = session_total - prev
+            else:
+                turn_cost = session_total  # first turn: turn cost = session total so far
+
+            state["prev_total"] = session_total
+
+            turn_str = format_cost_usd(turn_cost)
+            session_str = format_cost_usd(session_total)
+        except Exception:
+            turn_str = "?"
+            session_str = "?"
+
+        print(f"\033[2m💰 Turn: {turn_str} | Session: {session_str}\033[0m", flush=True)
+
+        return HookResult(action="continue")
+
+    return _on_orchestrator_complete, state
+
+
+__all__ = [
+    "mount",
+    "StreamingUIHooks",
+    "format_cost_usd",
+]

@@ -142,8 +142,36 @@ async def test_mount_with_defaults():
 
     await mount(coordinator, config)
 
-    # Should register 5 hooks: content_block:start, content_block:end, tool:pre, tool:post, llm:response
+    # Should register 6 hooks:
+    #   content_block:start, content_block:end, tool:pre, tool:post,
+    #   llm:response, orchestrator:complete
+    assert coordinator.hooks.register.call_count == 6
+
+
+@pytest.mark.asyncio
+async def test_mount_with_token_usage_disabled_skips_cost_handler():
+    """When show_token_usage=False, orchestrator:complete is not registered.
+
+    Users who disable token usage display should not see the cost footer either.
+    The per-call cost line and the 💰 turn/session footer are gated together.
+    """
+    coordinator = MagicMock()
+    coordinator.hooks = MagicMock()
+    coordinator.hooks.register = MagicMock()
+
+    config = {"ui": {"show_token_usage": False}}
+
+    await mount(coordinator, config)
+
+    # Only 5 hooks: content_block:start, content_block:end, tool:pre, tool:post,
+    # llm:response.
+    # orchestrator:complete is NOT registered when show_token_usage=False.
     assert coordinator.hooks.register.call_count == 5
+
+    registered_events = [
+        call[0][0] for call in coordinator.hooks.register.call_args_list
+    ]
+    assert "orchestrator:complete" not in registered_events
 
 
 class TestStreamingUIHooks:
@@ -709,3 +737,88 @@ class TestTokenUsageHeaderWithModelInfo:
         )
 
 
+# ─── Per-call cost display on Token Usage line ───────────────────────────────
+
+
+class TestTokenUsageCostDisplay:
+    """Test that per-call cost_usd from M2 providers appears on the Token Usage line."""
+
+    @pytest.mark.asyncio
+    async def test_token_usage_shows_cost_when_present(self, capsys):
+        """cost_usd on the usage dict produces '| Cost: $X.XX' on the Token Usage line."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "hi"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "total_tokens": 1500,
+                "cost_usd": "0.0043",  # sub-cent: formats as $0.0043
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Cost:" in captured.out, "Cost field missing from Token Usage line"
+        assert "$0.0043" in captured.out, (
+            f"Expected $0.0043 in output, got: {captured.out}"
+        )
+        # Full expected format check
+        assert "Input: 1,000" in captured.out
+        assert "Output: 500" in captured.out
+        assert "Total: 1,500" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_token_usage_omits_cost_when_absent(self, capsys):
+        """When cost_usd is absent, the Token Usage line does not show 'Cost:'."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "hi"},
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                # no cost_usd — self-hosted / unknown model
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Cost:" not in captured.out, (
+            f"Cost: should not appear when cost_usd is absent, got: {captured.out}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_token_usage_omits_cost_when_none(self, capsys):
+        """When cost_usd is explicitly None, the Token Usage line does not show 'Cost:'."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "hi"},
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "cost_usd": None,  # self-hosted provider returns None
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Cost:" not in captured.out, (
+            f"Cost: should not appear when cost_usd is None, got: {captured.out}"
+        )
