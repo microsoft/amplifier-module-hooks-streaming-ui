@@ -32,34 +32,6 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_tool_lines = ui_config.get("show_tool_lines", 5)
     show_token_usage = ui_config.get("show_token_usage", True)
 
-    # ---------------------------------------------------------------------------
-    # Session cost accumulation — always on, independent of display config.
-    # Providers stamp cost_usd on Usage and emit it in llm:response; we read
-    # it here and maintain the running session total on the session.cost
-    # contributor channel so bridge_child_cost and the turn display below both
-    # have a single, consistent source of truth.
-    # ---------------------------------------------------------------------------
-    _cost_totals: dict = {"cost_usd": None, "has_data": False}
-
-    async def _accumulate_session_cost(event: str, data: dict) -> None:
-        raw = (data.get("usage") or {}).get("cost_usd")
-        if raw is not None:
-            _cost_totals["cost_usd"] = (
-                _cost_totals["cost_usd"]
-                if _cost_totals["cost_usd"] is not None
-                else Decimal("0")
-            ) + Decimal(str(raw))
-            _cost_totals["has_data"] = True
-
-    coordinator.hooks.register("llm:response", _accumulate_session_cost)
-    coordinator.register_contributor(
-        "session.cost",
-        "streaming-ui-cost-accumulator",
-        lambda: (
-            {"cost_usd": _cost_totals["cost_usd"]} if _cost_totals["has_data"] else None
-        ),
-    )
-
     # Create hook handlers
     hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage)
 

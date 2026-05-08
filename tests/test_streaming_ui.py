@@ -142,11 +142,10 @@ async def test_mount_with_defaults():
 
     await mount(coordinator, config)
 
-    # Should register 7 hooks:
+    # Should register 6 hooks:
     #   content_block:start, content_block:end, tool:pre, tool:post,
-    #   llm:response (display), llm:response (cost accumulator),
-    #   orchestrator:complete
-    assert coordinator.hooks.register.call_count == 7
+    #   llm:response, orchestrator:complete
+    assert coordinator.hooks.register.call_count == 6
 
 
 @pytest.mark.asyncio
@@ -164,10 +163,10 @@ async def test_mount_with_token_usage_disabled_skips_cost_handler():
 
     await mount(coordinator, config)
 
-    # Only 6 hooks: content_block:start, content_block:end, tool:pre, tool:post,
-    # llm:response (display), llm:response (cost accumulator).
+    # Only 5 hooks: content_block:start, content_block:end, tool:pre, tool:post,
+    # llm:response.
     # orchestrator:complete is NOT registered when show_token_usage=False.
-    assert coordinator.hooks.register.call_count == 6
+    assert coordinator.hooks.register.call_count == 5
 
     registered_events = [
         call[0][0] for call in coordinator.hooks.register.call_args_list
