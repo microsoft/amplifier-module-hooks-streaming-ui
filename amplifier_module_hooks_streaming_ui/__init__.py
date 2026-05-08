@@ -721,19 +721,23 @@ def _make_cost_handler(coordinator):
     state: dict[str, Decimal | None] = {"prev_total": None}
 
     async def _on_orchestrator_complete(event: str, data: dict):
-        contributions = await coordinator.collect_contributions("session.cost")
-        session_total = _sum_cost_usd(contributions)
+        try:
+            contributions = await coordinator.collect_contributions("session.cost")
+            session_total = _sum_cost_usd(contributions)
 
-        prev = state["prev_total"]
-        if session_total is not None and prev is not None:
-            turn_cost = session_total - prev
-        else:
-            turn_cost = session_total  # first turn: turn cost = session total so far
+            prev = state["prev_total"]
+            if session_total is not None and prev is not None:
+                turn_cost = session_total - prev
+            else:
+                turn_cost = session_total  # first turn: turn cost = session total so far
 
-        state["prev_total"] = session_total
+            state["prev_total"] = session_total
 
-        turn_str = format_cost_usd(turn_cost)
-        session_str = format_cost_usd(session_total)
+            turn_str = format_cost_usd(turn_cost)
+            session_str = format_cost_usd(session_total)
+        except Exception:
+            turn_str = "?"
+            session_str = "?"
 
         print(f"\033[2m💰 Turn: {turn_str} | Session: {session_str}\033[0m", flush=True)
 

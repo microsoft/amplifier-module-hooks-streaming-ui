@@ -128,3 +128,22 @@ async def test_mount_registers_orchestrator_complete_handler():
     await mount(coordinator, config={})
 
     assert "orchestrator:complete" in registered_hooks
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_degrades_on_error(capsys):
+    """Handler degrades to '?' when collect_contributions raises — never crashes the orchestrator."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(side_effect=RuntimeError("contributor exploded"))
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, _ = _make_cost_handler(coordinator)
+
+    result = await handler("orchestrator:complete", {})
+
+    captured = capsys.readouterr()
+    assert "💰" in captured.out
+    assert "?" in captured.out
+    assert isinstance(result, HookResult)
+    assert result.action == "continue"
