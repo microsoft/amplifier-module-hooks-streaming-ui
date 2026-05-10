@@ -364,20 +364,9 @@ class StreamingUIHooks:
             else:
                 header = "📊 Token Usage"
 
-            # cost_usd may arrive as Decimal (from Pydantic model fields) or str
-            # (from providers that serialize before emitting). Decimal(str(cost_raw))
-            # handles both safely.
-            cost_raw = usage.get("cost_usd")
-            cost_part = ""
-            if cost_raw is not None:
-                try:
-                    cost_part = f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
-                except Exception:
-                    cost_part = " | Cost: ?"
-
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
-                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
+                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}\033[0m"
             )
             # Clear for next request to avoid stale data
             self.last_llm_info = None
@@ -682,9 +671,14 @@ def format_cost_usd(cost: Decimal | None) -> str:
     if cost >= Decimal("0.01"):
         return f"${cost:.2f}"
     exp_floor = math.floor(math.log10(float(cost)))  # e.g. -4 for 0.0001, -3 for 0.0043
-    input_exp = -cost.as_tuple().exponent  # exponent of the input Decimal
-    decimal_places = max(-exp_floor, input_exp)
-    return f"${cost:.{decimal_places}f}"
+    # Cap at 2 significant figures. Do not use Decimal.as_tuple().exponent here —
+    # intermediate Decimal arithmetic (e.g. tokens * rate / 1_000_000) stores many
+    # trailing decimal places that would produce $0.000030000 instead of $0.00003.
+    decimal_places = -exp_floor + 1
+    result = f"${cost:.{decimal_places}f}"
+    # Strip trailing zeros from computed Decimal precision (e.g. Decimal("3.000") arithmetic).
+    # "0.00010" → "0.0001", "0.000030" → "0.00003". Never strips past the decimal.
+    return result.rstrip("0") or "$0.00"
 
 
 # Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
@@ -721,8 +715,24 @@ def _make_cost_handler(coordinator):
     state: dict[str, Decimal | None] = {"prev_total": None}
 
     async def _on_orchestrator_complete(event: str, data: dict):
+        # Skip sub-session orchestrator completions — only the root turn fires the cost summary.
+        # Sub-session events propagate up through the hook bus; detecting them by the underscore
+        # in their session_id (e.g. "abc-def_agent-name") prevents spurious mid-turn lines and
+        # keeps state["prev_total"] accurate across the full user turn.
+        session_id = data.get("session_id")
+        if session_id and "_" in session_id:
+            return HookResult(action="continue")
         try:
             contributions = await coordinator.collect_contributions("session.cost")
+            # INSTRUMENTATION: log raw contributions before summing
+            import logging as _logging
+            _probe_log = _logging.getLogger("cost_probe")
+            _probe_log.warning(
+                "[COST-DOUBLING-PROBE] orchestrator:complete — "
+                "collect_contributions returned %d item(s): %s",
+                len(contributions) if contributions else 0,
+                contributions,
+            )
             session_total = _sum_cost_usd(contributions)
 
             prev = state["prev_total"]
