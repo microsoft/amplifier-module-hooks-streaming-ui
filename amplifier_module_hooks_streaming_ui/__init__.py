@@ -364,9 +364,20 @@ class StreamingUIHooks:
             else:
                 header = "📊 Token Usage"
 
+            # cost_usd may arrive as Decimal (from Pydantic model fields) or str
+            # (from providers that serialize before emitting). Decimal(str(cost_raw))
+            # handles both safely.
+            cost_raw = usage.get("cost_usd")
+            cost_part = ""
+            if cost_raw is not None:
+                try:
+                    cost_part = f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
+                except Exception:
+                    cost_part = " | Cost: ?"
+
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
-                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}\033[0m"
+                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
             )
             # Clear for next request to avoid stale data
             self.last_llm_info = None
