@@ -724,15 +724,6 @@ def _make_cost_handler(coordinator):
             return HookResult(action="continue")
         try:
             contributions = await coordinator.collect_contributions("session.cost")
-            # INSTRUMENTATION: log raw contributions before summing
-            import logging as _logging
-            _probe_log = _logging.getLogger("cost_probe")
-            _probe_log.warning(
-                "[COST-DOUBLING-PROBE] orchestrator:complete — "
-                "collect_contributions returned %d item(s): %s",
-                len(contributions) if contributions else 0,
-                contributions,
-            )
             session_total = _sum_cost_usd(contributions)
 
             prev = state["prev_total"]
