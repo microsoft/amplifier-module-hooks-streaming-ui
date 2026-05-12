@@ -665,26 +665,39 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
     return "\n".join(fragment for fragment in fragments if fragment)
 
 
-def format_cost_usd(cost: Decimal | None) -> str:
+def format_cost_usd(cost: Decimal | str | None) -> str:
     """Format cost for terminal display.
 
     None  → "?"       (no rate data — never show $0.00 for unknown)
     0     → "$0.00"   (known-free)
-    ≥0.01 → "$X.XX"
-    <0.01 → 2 significant figures, e.g. "$0.0043"
+    ≥0.01 → "$X.XX"   (2 decimal places, e.g. "$0.09")
+    <0.01 → 2 significant figures, e.g. "$0.0064" for $0.00639785
+
+    Accepts Decimal or str — cost_usd values travel as strings through event
+    dicts and a direct str call must not silently produce "?".
     """
     if cost is None:
         return "?"
+    if isinstance(cost, str):
+        try:
+            cost = Decimal(cost)
+        except Exception:
+            return "?"
     if cost == Decimal("0"):
         return "$0.00"
     if cost < Decimal("0"):
         return "?"  # edge case: negative delta from contribution accounting
     if cost >= Decimal("0.01"):
         return f"${cost:.2f}"
-    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -4 for 0.0001, -3 for 0.0043
-    input_exp = -cost.as_tuple().exponent  # exponent of the input Decimal
-    decimal_places = max(-exp_floor, input_exp)
-    return f"${cost:.{decimal_places}f}"
+    # Sub-cent: 2 significant figures. Do not use Decimal.as_tuple().exponent here —
+    # intermediate Decimal arithmetic (e.g. tokens * rate / 1_000_000) stores many
+    # trailing decimal places that would produce $0.000030000 instead of $0.00003.
+    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -3 for 0.0064, -4 for 0.0001
+    decimal_places = -exp_floor + 1  # 2 sig figs
+    result = f"${cost:.{decimal_places}f}"
+    # Strip trailing zeros from computed Decimal precision (e.g. "$0.00400" → "$0.004").
+    # Never strips past the decimal point.
+    return result.rstrip("0") or "$0.00"
 
 
 # Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
@@ -721,6 +734,19 @@ def _make_cost_handler(coordinator):
     state: dict[str, Decimal | None] = {"prev_total": None}
 
     async def _on_orchestrator_complete(event: str, data: dict):
+        # Skip sub-session orchestrator completions — only the root turn fires the cost summary.
+        # Sub-session events propagate up through the hook bus; two forms must be excluded:
+        #   (a) explicit session ID with "_" delimiter (e.g. "abc-def_agent-name"), or
+        #   (b) session_id=None — a sub-session that omitted its ID from the payload.
+        # Root sessions either omit session_id entirely or carry a plain UUID (no underscore).
+        # The old guard `if session_id and "_" in session_id` was a truthiness check that
+        # short-circuits to False when session_id is None, letting (b) slip through and
+        # fire a spurious mid-turn summary while corrupting state["prev_total"].
+        session_id = data.get("session_id")
+        if "session_id" in data and session_id is None:
+            return HookResult(action="continue")
+        if session_id and "_" in session_id:
+            return HookResult(action="continue")
         try:
             contributions = await coordinator.collect_contributions("session.cost")
             session_total = _sum_cost_usd(contributions)
