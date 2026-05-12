@@ -666,12 +666,12 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
 
 
 def format_cost_usd(cost: Decimal | None) -> str:
-    """Format cost for terminal display using 4 significant figures.
+    """Format cost for terminal display.
 
     None  → "?"       (no rate data — never show $0.00 for unknown)
     0     → "$0.00"   (known-free)
-    otherwise: 4 significant figures, trailing zeros stripped
-               e.g. $0.09, $0.0043, $1.23, $0.0101
+    ≥0.01 → "$X.XX"   (2 decimal places, e.g. "$0.09")
+    <0.01 → 2 significant figures, e.g. "$0.0064" for $0.00639785
     """
     if cost is None:
         return "?"
@@ -679,17 +679,16 @@ def format_cost_usd(cost: Decimal | None) -> str:
         return "$0.00"
     if cost < Decimal("0"):
         return "?"  # edge case: negative delta from contribution accounting
-    # Unified 4-significant-figures formatting — consistent across all cost magnitudes.
-    # The previous two-regime split at $0.01 produced misleading rounding: a cost of
-    # $0.014 displayed as "$0.01" while $0.0099 displayed as "$0.0099" — almost the
-    # same money, radically different precision. 4 sig figs avoids this cliff.
-    # Do not use Decimal.as_tuple().exponent — intermediate Decimal arithmetic stores
-    # many trailing places that would produce $0.000030000 instead of $0.00003.
-    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -2 for 0.09, -4 for 0.0001
-    decimal_places = max(-exp_floor + 3, 0)  # 4 sig figs; clamped at 0 for values ≥ $1000
+    if cost >= Decimal("0.01"):
+        return f"${cost:.2f}"
+    # Sub-cent: 2 significant figures. Do not use Decimal.as_tuple().exponent here —
+    # intermediate Decimal arithmetic (e.g. tokens * rate / 1_000_000) stores many
+    # trailing decimal places that would produce $0.000030000 instead of $0.00003.
+    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -3 for 0.0064, -4 for 0.0001
+    decimal_places = -exp_floor + 1  # 2 sig figs
     result = f"${cost:.{decimal_places}f}"
-    # Strip trailing zeros from computed Decimal arithmetic (e.g. 0.09000 → 0.09,
-    # 0.004300 → 0.0043). Never strips past the decimal point.
+    # Strip trailing zeros from computed Decimal precision (e.g. "$0.00400" → "$0.004").
+    # Never strips past the decimal point.
     return result.rstrip("0") or "$0.00"
 
 

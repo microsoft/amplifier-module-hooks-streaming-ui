@@ -16,27 +16,24 @@ class TestFormatCostUsd:
     def test_zero_returns_zero_dollars(self):
         assert format_cost_usd(Decimal("0")) == "$0.00"
 
-    def test_above_one_cent_uses_four_significant_figures(self):
+    def test_above_one_cent_uses_two_decimal_places(self):
         assert format_cost_usd(Decimal("0.09")) == "$0.09"
         assert format_cost_usd(Decimal("1.23")) == "$1.23"
 
-    def test_sub_cent_uses_four_significant_figures(self):
+    def test_sub_cent_uses_two_significant_figures(self):
         assert format_cost_usd(Decimal("0.0043")) == "$0.0043"
         assert format_cost_usd(Decimal("0.0001")) == "$0.0001"
 
-    def test_boundary_precision_near_one_cent(self):
-        """Regression for #231: no precision cliff at the $0.01 boundary.
+    def test_sub_cent_truncates_raw_decimal_arithmetic(self):
+        """Regression for #231: raw Decimal values with many decimal places are
+        formatted to 2 significant figures, not shown as-is.
 
-        The old two-regime split rounded $0.014 to "$0.01" and showed "$0.0099"
-        for an almost identical amount — same money, radically different precision.
+        Brian saw "$0.00639785" in the display — the correct output is "$0.0064".
+        The formatter must round to 2 sig figs, never leak raw Decimal precision.
         """
-        # Values just below $0.01 — must use 4 sig figs, not be rounded to $0.00xx
+        assert format_cost_usd(Decimal("0.00639785")) == "$0.0064"
         assert format_cost_usd(Decimal("0.0099")) == "$0.0099"
         assert format_cost_usd(Decimal("0.0047")) == "$0.0047"
-        # Values just above $0.01 — old code rounded to 2dp, losing significant digits
-        assert format_cost_usd(Decimal("0.0101")) == "$0.0101"  # was "$0.01" before fix
-        assert format_cost_usd(Decimal("0.014")) == "$0.014"    # was "$0.01" before fix
-        assert format_cost_usd(Decimal("0.0933")) == "$0.0933"  # was "$0.09" before fix
 
     def test_never_returns_float(self):
         result = format_cost_usd(Decimal("0.05"))
