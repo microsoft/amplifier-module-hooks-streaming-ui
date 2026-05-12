@@ -35,6 +35,18 @@ class TestFormatCostUsd:
         assert format_cost_usd(Decimal("0.0099")) == "$0.0099"
         assert format_cost_usd(Decimal("0.0047")) == "$0.0047"
 
+    def test_string_input_is_coerced(self):
+        """format_cost_usd must accept str — cost_usd travels as str through event dicts.
+
+        If a caller passes the raw event value directly (without first wrapping in
+        Decimal), the function should format it correctly rather than silently
+        returning '?' via a TypeError on the Decimal comparison.
+        """
+        assert format_cost_usd("0.09") == "$0.09"
+        assert format_cost_usd("0.0064") == "$0.0064"
+        assert format_cost_usd("0") == "$0.00"
+        assert format_cost_usd("not-a-number") == "?"
+
     def test_never_returns_float(self):
         result = format_cost_usd(Decimal("0.05"))
         assert isinstance(result, str)

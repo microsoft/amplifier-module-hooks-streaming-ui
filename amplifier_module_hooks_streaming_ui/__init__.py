@@ -665,16 +665,24 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
     return "\n".join(fragment for fragment in fragments if fragment)
 
 
-def format_cost_usd(cost: Decimal | None) -> str:
+def format_cost_usd(cost: Decimal | str | None) -> str:
     """Format cost for terminal display.
 
     None  → "?"       (no rate data — never show $0.00 for unknown)
     0     → "$0.00"   (known-free)
     ≥0.01 → "$X.XX"   (2 decimal places, e.g. "$0.09")
     <0.01 → 2 significant figures, e.g. "$0.0064" for $0.00639785
+
+    Accepts Decimal or str — cost_usd values travel as strings through event
+    dicts and a direct str call must not silently produce "?".
     """
     if cost is None:
         return "?"
+    if isinstance(cost, str):
+        try:
+            cost = Decimal(cost)
+        except Exception:
+            return "?"
     if cost == Decimal("0"):
         return "$0.00"
     if cost < Decimal("0"):
