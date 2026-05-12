@@ -666,12 +666,12 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
 
 
 def format_cost_usd(cost: Decimal | None) -> str:
-    """Format cost for terminal display.
+    """Format cost for terminal display using 4 significant figures.
 
     None  → "?"       (no rate data — never show $0.00 for unknown)
     0     → "$0.00"   (known-free)
-    ≥0.01 → "$X.XX"
-    <0.01 → 2 significant figures, e.g. "$0.0043"
+    otherwise: 4 significant figures, trailing zeros stripped
+               e.g. $0.09, $0.0043, $1.23, $0.0101
     """
     if cost is None:
         return "?"
@@ -679,16 +679,17 @@ def format_cost_usd(cost: Decimal | None) -> str:
         return "$0.00"
     if cost < Decimal("0"):
         return "?"  # edge case: negative delta from contribution accounting
-    if cost >= Decimal("0.01"):
-        return f"${cost:.2f}"
-    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -4 for 0.0001, -3 for 0.0043
-    # Cap at 2 significant figures. Do not use Decimal.as_tuple().exponent here —
-    # intermediate Decimal arithmetic (e.g. tokens * rate / 1_000_000) stores many
-    # trailing decimal places that would produce $0.000030000 instead of $0.00003.
-    decimal_places = -exp_floor + 1
+    # Unified 4-significant-figures formatting — consistent across all cost magnitudes.
+    # The previous two-regime split at $0.01 produced misleading rounding: a cost of
+    # $0.014 displayed as "$0.01" while $0.0099 displayed as "$0.0099" — almost the
+    # same money, radically different precision. 4 sig figs avoids this cliff.
+    # Do not use Decimal.as_tuple().exponent — intermediate Decimal arithmetic stores
+    # many trailing places that would produce $0.000030000 instead of $0.00003.
+    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -2 for 0.09, -4 for 0.0001
+    decimal_places = max(-exp_floor + 3, 0)  # 4 sig figs; clamped at 0 for values ≥ $1000
     result = f"${cost:.{decimal_places}f}"
-    # Strip trailing zeros from computed Decimal precision (e.g. Decimal("3.000") arithmetic).
-    # "0.00010" → "0.0001", "0.000030" → "0.00003". Never strips past the decimal.
+    # Strip trailing zeros from computed Decimal arithmetic (e.g. 0.09000 → 0.09,
+    # 0.004300 → 0.0043). Never strips past the decimal point.
     return result.rstrip("0") or "$0.00"
 
 
@@ -727,10 +728,16 @@ def _make_cost_handler(coordinator):
 
     async def _on_orchestrator_complete(event: str, data: dict):
         # Skip sub-session orchestrator completions — only the root turn fires the cost summary.
-        # Sub-session events propagate up through the hook bus; detecting them by the underscore
-        # in their session_id (e.g. "abc-def_agent-name") prevents spurious mid-turn lines and
-        # keeps state["prev_total"] accurate across the full user turn.
+        # Sub-session events propagate up through the hook bus; two forms must be excluded:
+        #   (a) explicit session ID with "_" delimiter (e.g. "abc-def_agent-name"), or
+        #   (b) session_id=None — a sub-session that omitted its ID from the payload.
+        # Root sessions either omit session_id entirely or carry a plain UUID (no underscore).
+        # The old guard `if session_id and "_" in session_id` was a truthiness check that
+        # short-circuits to False when session_id is None, letting (b) slip through and
+        # fire a spurious mid-turn summary while corrupting state["prev_total"].
         session_id = data.get("session_id")
+        if "session_id" in data and session_id is None:
+            return HookResult(action="continue")
         if session_id and "_" in session_id:
             return HookResult(action="continue")
         try:

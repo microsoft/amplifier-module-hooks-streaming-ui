@@ -16,13 +16,27 @@ class TestFormatCostUsd:
     def test_zero_returns_zero_dollars(self):
         assert format_cost_usd(Decimal("0")) == "$0.00"
 
-    def test_above_one_cent_uses_two_decimal(self):
+    def test_above_one_cent_uses_four_significant_figures(self):
         assert format_cost_usd(Decimal("0.09")) == "$0.09"
         assert format_cost_usd(Decimal("1.23")) == "$1.23"
 
-    def test_sub_cent_uses_two_significant_figures(self):
+    def test_sub_cent_uses_four_significant_figures(self):
         assert format_cost_usd(Decimal("0.0043")) == "$0.0043"
         assert format_cost_usd(Decimal("0.0001")) == "$0.0001"
+
+    def test_boundary_precision_near_one_cent(self):
+        """Regression for #231: no precision cliff at the $0.01 boundary.
+
+        The old two-regime split rounded $0.014 to "$0.01" and showed "$0.0099"
+        for an almost identical amount — same money, radically different precision.
+        """
+        # Values just below $0.01 — must use 4 sig figs, not be rounded to $0.00xx
+        assert format_cost_usd(Decimal("0.0099")) == "$0.0099"
+        assert format_cost_usd(Decimal("0.0047")) == "$0.0047"
+        # Values just above $0.01 — old code rounded to 2dp, losing significant digits
+        assert format_cost_usd(Decimal("0.0101")) == "$0.0101"  # was "$0.01" before fix
+        assert format_cost_usd(Decimal("0.014")) == "$0.014"    # was "$0.01" before fix
+        assert format_cost_usd(Decimal("0.0933")) == "$0.0933"  # was "$0.09" before fix
 
     def test_never_returns_float(self):
         result = format_cost_usd(Decimal("0.05"))
@@ -145,5 +159,117 @@ async def test_orchestrator_complete_degrades_on_error(capsys):
     captured = capsys.readouterr()
     assert "💰" in captured.out
     assert "?" in captured.out
+    assert isinstance(result, HookResult)
+    assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# Bug #230 regression: sub-session events must not fire the cost summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_skips_subsession_none_session_id(capsys):
+    """Regression for #230: session_id=None in payload must NOT fire the cost summary.
+
+    The old guard `if session_id and "_" in session_id` short-circuits to False
+    when session_id is None, letting sub-session events without an explicit ID
+    slip through and print a spurious mid-turn line.
+    """
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.04")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, state = _make_cost_handler(coordinator)
+
+    result = await handler("orchestrator:complete", {"session_id": None})
+
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no 💰 line printed
+    assert state["prev_total"] is None  # state must not be mutated
+    assert isinstance(result, HookResult)
+    assert result.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_skips_subsession_explicit_id(capsys):
+    """Sub-session with explicit underscore session ID must NOT fire the cost summary."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.04")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, state = _make_cost_handler(coordinator)
+
+    result = await handler("orchestrator:complete", {"session_id": "abc-def_agent-name"})
+
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no 💰 line printed
+    assert state["prev_total"] is None  # state must not be mutated
+    assert isinstance(result, HookResult)
+    assert result.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_state_not_corrupted_by_subsession(capsys):
+    """Regression for #230: a sub-session event must not corrupt prev_total.
+
+    Old bug sequence:
+      1. Sub-session completes mid-turn (session_id=None) → handler fires
+      2. state["prev_total"] is set to the in-progress session total ($0.04)
+      3. Root turn completes → turn_cost = $0.09 - $0.04 = $0.05 (WRONG)
+         should be $0.09 (first root turn, prev_total should still be None)
+    """
+    coordinator = MagicMock()
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, state = _make_cost_handler(coordinator)
+
+    # Sub-session fires first (mid-turn delegated agent completes)
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.04")}]
+    )
+    await handler("orchestrator:complete", {"session_id": None})
+    capsys.readouterr()  # discard (should be empty; assertion covered by other test)
+
+    # Root session fires (the real turn completion)
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.09")}]
+    )
+    await handler("orchestrator:complete", {})
+    captured = capsys.readouterr()
+
+    # Turn cost must be the full $0.09 (first root turn), not the $0.05 delta
+    # that a corrupted prev_total of $0.04 would have produced.
+    assert "Turn: $0.09" in captured.out
+    assert "Session: $0.09" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_fires_for_root_with_uuid_session_id(capsys):
+    """Root session with an explicit UUID (no underscore) still fires the cost summary."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.09")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    handler, _ = _make_cost_handler(coordinator)
+
+    result = await handler(
+        "orchestrator:complete",
+        {"session_id": "12345678-abcd-1234-abcd-123456789012"},
+    )
+
+    captured = capsys.readouterr()
+    assert "💰" in captured.out
+    assert "$0.09" in captured.out
     assert isinstance(result, HookResult)
     assert result.action == "continue"
