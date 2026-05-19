@@ -36,14 +36,30 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage)
 
     # Register hooks on the coordinator
-    coordinator.hooks.register("content_block:start", hooks.handle_content_block_start)
-    coordinator.hooks.register("content_block:end", hooks.handle_content_block_end)
-    coordinator.hooks.register("tool:pre", hooks.handle_tool_pre)
-    coordinator.hooks.register("tool:post", hooks.handle_tool_post)
-    coordinator.hooks.register("llm:response", hooks.handle_llm_response)
+    coordinator.hooks.register(
+        "content_block:start",
+        hooks.handle_content_block_start,
+        name="streaming-ui-content-block-start",
+    )
+    coordinator.hooks.register(
+        "content_block:end",
+        hooks.handle_content_block_end,
+        name="streaming-ui-content-block-end",
+    )
+    coordinator.hooks.register(
+        "tool:pre", hooks.handle_tool_pre, name="streaming-ui-tool-pre"
+    )
+    coordinator.hooks.register(
+        "tool:post", hooks.handle_tool_post, name="streaming-ui-tool-post"
+    )
+    coordinator.hooks.register(
+        "llm:response", hooks.handle_llm_response, name="streaming-ui-llm-response"
+    )
     if show_token_usage:
         _cost_handler, _ = _make_cost_handler(coordinator)
-        coordinator.hooks.register("orchestrator:complete", _cost_handler)
+        coordinator.hooks.register(
+            "orchestrator:complete", _cost_handler, name="streaming-ui-cost-summary"
+        )
     # Log successful mount
     logger.info("Mounted hooks-streaming-ui")
 
@@ -755,7 +771,9 @@ def _make_cost_handler(coordinator):
             if session_total is not None and prev is not None:
                 turn_cost = session_total - prev
             else:
-                turn_cost = session_total  # first turn: turn cost = session total so far
+                turn_cost = (
+                    session_total  # first turn: turn cost = session total so far
+                )
 
             state["prev_total"] = session_total
 
