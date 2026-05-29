@@ -8,6 +8,9 @@ __amplifier_module_type__ = "hook"
 
 import logging
 import math
+import os
+import re
+import signal
 import sys
 from decimal import Decimal
 from typing import Any
@@ -60,8 +63,93 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         coordinator.hooks.register(
             "orchestrator:complete", _cost_handler, name="streaming-ui-cost-summary"
         )
+
+    # --- Token-level streaming renderer --------------------------------------
+    # Only register if stdout is a TTY. When piped or redirected, the CLI's
+    # output is an API (`amplifier "x" > out.txt`); streamed tokens would be
+    # unparseable noise. In non-TTY mode, no one sets streamed_this_turn,
+    # the batch render at main.py:2800 fires normally, output stays clean.
+    _is_tty = (
+        sys.stdout.isatty()
+        if hasattr(sys.stdout, "isatty")
+        else False
+    )
+    if _is_tty:
+        # --- CR-1 streamed-flag plumbing -------------------------------------
+        # The CLI batch-renders each turn via render_message at main.py:2800.
+        # When we paint tokens live, we suppress that batch render to avoid
+        # double-output. The signal travels via coordinator.session_state, a
+        # mutable dict observable from main.py between CLEANUP_RENDER_BEGIN
+        # (line 2795) and the render call (line 2800).
+        (
+            _delta_h,
+            _thinking_delta_h,
+            _prompt_submit_h,
+            _render_begin_h,
+        ) = _make_streamed_flag_handlers(coordinator)
+        coordinator.hooks.register(
+            "content_block:delta", _delta_h, name="streaming-ui-flag-delta"
+        )
+        coordinator.hooks.register(
+            "thinking:delta",
+            _thinking_delta_h,
+            name="streaming-ui-flag-thinking-delta",
+        )
+        coordinator.hooks.register(
+            "prompt:submit", _prompt_submit_h, name="streaming-ui-flag-reset"
+        )
+        coordinator.hooks.register(
+            "cleanup:render_begin",
+            _render_begin_h,
+            name="streaming-ui-flag-render-begin-noop",
+        )
+
+        # --- Token painter ----------------------------------------------------
+        # Subscribes to content_block:delta, thinking:delta, content_block:
+        # stream_done, llm:stream_aborted, PROVIDER_RETRY. Per-session state
+        # (line buffer, accumulator, partial-escape pending) lives in the
+        # factory closure.
+        (
+            _r_delta_h,
+            _r_thinking_h,
+            _r_stream_done_h,
+            _r_aborted_h,
+            _r_retry_h,
+            _r_prompt_h,
+        ) = _make_streaming_renderer(coordinator)
+        coordinator.hooks.register(
+            "content_block:delta",
+            _r_delta_h,
+            name="streaming-ui-renderer-delta",
+        )
+        coordinator.hooks.register(
+            "thinking:delta",
+            _r_thinking_h,
+            name="streaming-ui-renderer-thinking",
+        )
+        coordinator.hooks.register(
+            "content_block:stream_done",
+            _r_stream_done_h,
+            name="streaming-ui-renderer-stream-done",
+        )
+        coordinator.hooks.register(
+            "llm:stream_aborted",
+            _r_aborted_h,
+            name="streaming-ui-renderer-aborted",
+        )
+        coordinator.hooks.register(
+            "provider:retry",
+            _r_retry_h,
+            name="streaming-ui-renderer-retry",
+        )
+        coordinator.hooks.register(
+            "prompt:submit",
+            _r_prompt_h,
+            name="streaming-ui-renderer-prompt-reset",
+        )
+
     # Log successful mount
-    logger.info("Mounted hooks-streaming-ui")
+    logger.info("Mounted hooks-streaming-ui (tty=%s)", _is_tty)
 
     return
 
@@ -741,6 +829,466 @@ def _sum_cost_usd(contributions: list) -> Decimal | None:
     return total
 
 
+def _make_streamed_flag_handlers(coordinator):
+    """Create the four handlers that maintain the per-turn `streamed_this_turn`
+    flag used to suppress the CLI's batch render when we painted tokens live.
+
+    Returns (delta_handler, thinking_delta_handler, prompt_submit_handler,
+    render_begin_handler) — all closures that capture `coordinator` and mutate
+    `coordinator.session_state["streamed_this_turn"]`.
+
+    Lifecycle:
+      prompt:submit          → clear flag (new turn begins)
+      content_block:delta    → set flag (text streamed)
+      thinking:delta         → set flag (thinking streamed)
+      cleanup:render_begin   → no-op; flag is read by main.py:2797 before
+                               the batch render at line 2800. Registering a
+                               handler is optional, but it guarantees the
+                               event has subscribers (some observability
+                               assertions depend on this).
+
+    Closure-capture pattern matches `_make_cost_handler` below.
+    """
+
+    async def _on_content_block_delta(
+        _event: str, _data: dict[str, Any]
+    ) -> HookResult:
+        coordinator.session_state["streamed_this_turn"] = True
+        return HookResult(action="continue")
+
+    async def _on_thinking_delta(_event: str, _data: dict[str, Any]) -> HookResult:
+        coordinator.session_state["streamed_this_turn"] = True
+        return HookResult(action="continue")
+
+    async def _on_prompt_submit(_event: str, _data: dict[str, Any]) -> HookResult:
+        coordinator.session_state["streamed_this_turn"] = False
+        return HookResult(action="continue")
+
+    async def _on_cleanup_render_begin(
+        _event: str, _data: dict[str, Any]
+    ) -> HookResult:
+        # Observability-only no-op. The flag READ happens in main.py:2797.
+        return HookResult(action="continue")
+
+    return (
+        _on_content_block_delta,
+        _on_thinking_delta,
+        _on_prompt_submit,
+        _on_cleanup_render_begin,
+    )
+
+
+# =============================================================================
+# Token-level streaming renderer
+# =============================================================================
+#
+# Subscribes to the kernel-reserved delta events (content_block:delta,
+# thinking:delta) plus our stream lifecycle events (content_block:stream_done,
+# llm:stream_aborted, provider:retry, prompt:submit) and paints tokens to the
+# terminal as they arrive.
+#
+# Output discipline (C11):
+#   - Parent assistant text → stdout (matches the existing batch-render path
+#     so `amplifier "x" > out.txt` keeps the same destination).
+#   - Sub-agent text       → stderr, line-buffered with [agent] prefix.
+#   - All thinking deltas  → stderr, dim styling (consistent with existing
+#     thinking display in handle_content_block_end).
+#   - All status markers   → stderr.
+#
+# Parallel sub-agent handling (C7, Invariant 10): sub-agent text is buffered
+# per session_id and flushed atomically on newline or stream_done. Multiple
+# sub-agents producing tokens at once interleave at line granularity, not
+# per-token. The kernel hook bus's per-source FIFO (verified in spike S3)
+# guarantees we never see a sub-agent's content_block:end before its last
+# delta.
+#
+# ANSI swap (Invariant 12): on content_block:stream_done for the parent
+# session, we cursor-up by the row count of Markdown(accumulated) (computed
+# via console.render_lines, which matches wcwidth ground truth per spike S2),
+# clear-down, and reprint as Markdown. Falls back to no swap (plain text
+# stays) on capability-uncertain terminals or after SIGWINCH.
+#
+# Sanitizer (Invariant 9): model output is untrusted; treat it as such.
+# Stateful per-session escape-sequence holder catches sequences split across
+# delta boundaries. Unicode bidirectional control characters stripped
+# explicitly (Trojan Source CVE-2021-42574).
+
+_BIDI_CHARS = (
+    "\u200e"  # LEFT-TO-RIGHT MARK
+    "\u200f"  # RIGHT-TO-LEFT MARK
+    "\u202b"  # RIGHT-TO-LEFT EMBEDDING
+    "\u202e"  # RIGHT-TO-LEFT OVERRIDE
+    "\u2066"  # LEFT-TO-RIGHT ISOLATE
+    "\u2067"  # RIGHT-TO-LEFT ISOLATE
+    "\u2068"  # FIRST STRONG ISOLATE
+    "\u2069"  # POP DIRECTIONAL ISOLATE
+)
+_BIDI_TRANS = {ord(c): None for c in _BIDI_CHARS}
+
+# Complete escape sequences we strip: CSI (\x1b[...final), OSC (\x1b]...ST),
+# and short Fp/Fs forms (\x1b<single final>).
+_CSI_RE = re.compile(r"\x1b\[?[\x20-\x3F]*[\x40-\x7E]")
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_FPFS_RE = re.compile(r"\x1b[@-Z\\-_]")
+
+
+def _sanitize_delta(text: str, pending: str) -> tuple[str, str]:
+    """Strip terminal control sequences and Unicode bidi controls from `text`,
+    handling the case where an escape sequence is split across delta boundaries.
+
+    `pending` is whatever incomplete escape was held over from the previous
+    call. Returns (cleaned_text_to_emit, new_pending_to_hold).
+    """
+    full = pending + text
+
+    # If the trailing tail of `full` looks like the start of an unterminated
+    # escape sequence, hold from that point onward and emit only the prefix.
+    new_pending = ""
+    last_esc = full.rfind("\x1b")
+    if last_esc >= 0:
+        tail = full[last_esc:]
+        # If tail matches a complete escape, no holding needed.
+        if not (
+            _CSI_RE.match(tail) or _OSC_RE.match(tail) or _FPFS_RE.match(tail)
+        ):
+            # Incomplete escape — hold from \x1b onward.
+            new_pending = tail
+            full = full[:last_esc]
+
+    # Strip every complete escape sequence we recognize.
+    cleaned = _OSC_RE.sub("", full)
+    cleaned = _CSI_RE.sub("", cleaned)
+    cleaned = _FPFS_RE.sub("", cleaned)
+
+    # Strip Unicode bidi controls.
+    cleaned = cleaned.translate(_BIDI_TRANS)
+
+    # Strip C0/C1 control characters except newline and tab.
+    cleaned = "".join(
+        c
+        for c in cleaned
+        if c in ("\n", "\t")
+        or (0x20 <= ord(c) <= 0x7E)
+        or ord(c) > 0x9F
+    )
+
+    return cleaned, new_pending
+
+
+def _parse_agent(session_id: str | None) -> str | None:
+    """Extract the agent name from a sub-session ID per W3C trace context:
+    `{parent-span}-{child-span}_{agent-name}`. Returns None for the root
+    session.
+    """
+    if not session_id or "_" not in session_id:
+        return None
+    parts = session_id.split("_", 1)
+    return parts[1] if len(parts) == 2 else None
+
+
+def _make_streaming_renderer(coordinator):
+    """Create the six handlers that paint per-token streaming output and the
+    closure-captured state dict they share.
+
+    The factory pattern mirrors `_make_cost_handler` and
+    `_make_streamed_flag_handlers` above. State is per session_id so parallel
+    sub-agents don't trip over each other.
+
+    Returns: (
+        content_block_delta_handler,
+        thinking_delta_handler,
+        content_block_stream_done_handler,
+        llm_stream_aborted_handler,
+        provider_retry_handler,
+        prompt_submit_handler,
+    )
+    """
+    # Per-session state. Each entry:
+    #   {
+    #     "accumulated":    str,    # parent: full text buffer for ANSI swap
+    #     "line_buffer":    str,    # sub-agent: pending partial line
+    #     "escape_pending": str,    # sanitizer carryover
+    #     "painted":        bool,   # any output written this turn?
+    #   }
+    state: dict[str, dict[str, Any]] = {}
+
+    # SIGWINCH tripwire. If the terminal resized mid-stream, our row math is
+    # stale and the swap will misalign. Capture the time of the last resize.
+    last_winch_ts: dict[str, float] = {"t": 0.0}
+
+    def _on_winch(_signum, _frame):
+        import time as _t
+
+        last_winch_ts["t"] = _t.time()
+
+    # signal.signal returns the previous handler (None if default). We don't
+    # restore it on unmount — mount happens once per process.
+    try:
+        signal.signal(signal.SIGWINCH, _on_winch)
+    except (ValueError, AttributeError, OSError):
+        # SIGWINCH unavailable (e.g. non-main thread, Windows). Without it
+        # we can't detect resize; the swap may misalign on resize. Acceptable
+        # degradation — falls into the "abandon swap, leave plain text" path.
+        pass
+
+    # Console for parent output (stdout) — used only for the final Markdown
+    # repaint. Console for stderr is built on demand inside handlers.
+    parent_console = Console(file=sys.stdout, highlight=False)
+
+    def _get(session_id: str) -> dict[str, Any]:
+        s = state.get(session_id)
+        if s is None:
+            s = {
+                "accumulated": "",
+                "line_buffer": "",
+                "escape_pending": "",
+                "painted": False,
+                "stream_start_ts": 0.0,
+                "agent": _parse_agent(session_id),
+            }
+            state[session_id] = s
+        return s
+
+    def _reset(session_id: str) -> None:
+        s = state.get(session_id)
+        if s is None:
+            return
+        s["accumulated"] = ""
+        s["line_buffer"] = ""
+        s["escape_pending"] = ""
+        s["painted"] = False
+        s["stream_start_ts"] = 0.0
+
+    async def _on_content_block_delta(
+        _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        text = data.get("text", "")
+        if not text:
+            return HookResult(action="continue")
+
+        session_id = data.get("session_id") or ""
+        s = _get(session_id)
+        clean, s["escape_pending"] = _sanitize_delta(text, s["escape_pending"])
+        if not clean:
+            return HookResult(action="continue")
+
+        agent = s["agent"]
+        if agent is None:
+            # Parent: stream to stdout, accumulate for ANSI swap.
+            try:
+                sys.stdout.write(clean)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                # Reader closed pipe (e.g. `amplifier "x" | head -1`). Drop
+                # subsequent paint silently; the streamed_this_turn flag
+                # already suppresses the batch render so the process can
+                # complete cleanly.
+                return HookResult(action="continue")
+            s["accumulated"] += clean
+            if not s["painted"]:
+                import time as _t
+
+                s["stream_start_ts"] = _t.time()
+            s["painted"] = True
+        else:
+            # Sub-agent: buffer to stderr line-by-line. Multiple sub-agents
+            # producing in parallel interleave at line granularity.
+            s["line_buffer"] += clean
+            while "\n" in s["line_buffer"]:
+                line, s["line_buffer"] = s["line_buffer"].split("\n", 1)
+                try:
+                    # Cyan label + 4-space indent matches existing sub-agent
+                    # styling for thinking/tool (lines 194-201, 252-265).
+                    sys.stderr.write(
+                        f"    \033[36m[{agent}]\033[0m \033[2m{line}\033[0m\n"
+                    )
+                    sys.stderr.flush()
+                except BrokenPipeError:
+                    return HookResult(action="continue")
+            s["painted"] = True
+
+        return HookResult(action="continue")
+
+    async def _on_thinking_delta(
+        _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        text = data.get("text", "")
+        if not text:
+            return HookResult(action="continue")
+
+        session_id = data.get("session_id") or ""
+        s = _get(session_id)
+        clean, s["escape_pending"] = _sanitize_delta(text, s["escape_pending"])
+        if not clean:
+            return HookResult(action="continue")
+
+        # Thinking always to stderr, dim. Parent has no indent; sub-agent
+        # gets the 4-space indent.
+        agent = s["agent"]
+        indent = "    " if agent else ""
+        prefix = f"[{agent}] " if agent else ""
+        try:
+            # Stream the clean text as-is. Newlines pass through; the dim
+            # styling is applied per write, not per line (acceptable
+            # smearing — thinking output is informational).
+            for line in clean.splitlines(keepends=True):
+                if line.endswith("\n"):
+                    body = line.rstrip("\n")
+                    sys.stderr.write(
+                        f"{indent}\033[2m{prefix}{body}\033[0m\n"
+                    )
+                else:
+                    sys.stderr.write(f"{indent}\033[2m{prefix}{line}\033[0m")
+            sys.stderr.flush()
+        except BrokenPipeError:
+            pass
+        s["painted"] = True
+
+        return HookResult(action="continue")
+
+    async def _on_content_block_stream_done(
+        _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        """End of the model's stream. Trigger the ANSI swap for parent text
+        if it's safe; flush any sub-agent partial line."""
+        import time as _t
+
+        session_id = data.get("session_id") or ""
+        s = state.get(session_id)
+        if s is None:
+            return HookResult(action="continue")
+
+        agent = s["agent"]
+
+        if agent is None:
+            # Parent: attempt ANSI swap → final Markdown render.
+            full = s["accumulated"]
+            if not s["painted"] or not full:
+                _reset(session_id)
+                return HookResult(action="continue")
+
+            # Abandon swap if a SIGWINCH fired during the stream — the
+            # column width sampled when we computed wrap points is stale.
+            resized = last_winch_ts["t"] > s["stream_start_ts"]
+
+            # Abandon swap if TERM looks unreliable (no value, or "dumb").
+            term = os.environ.get("TERM", "")
+            term_ok = bool(term) and term not in ("dumb", "unknown")
+
+            if not resized and term_ok:
+                # Compute the exact number of terminal rows the streamed plain
+                # text occupied (wcwidth-aware via rich.console.render_lines).
+                try:
+                    rendered = parent_console.render_lines(
+                        Markdown(full), options=parent_console.options
+                    )
+                    plain_rows = len(rendered)
+                except Exception:
+                    plain_rows = 0
+
+                if plain_rows > 0:
+                    try:
+                        # Move up to start of streamed region, clear it,
+                        # repaint as Markdown.
+                        sys.stdout.write(f"\033[{plain_rows}A\033[J")
+                        sys.stdout.flush()
+                        parent_console.print(Markdown(full))
+                    except BrokenPipeError:
+                        pass
+                else:
+                    # Couldn't measure (degenerate input). Emit a newline so
+                    # the next prompt isn't crammed against the streamed text.
+                    try:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    except BrokenPipeError:
+                        pass
+            else:
+                # Capability fallback: plain stays, just terminate with a
+                # newline so the next prompt isn't crammed.
+                try:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                except BrokenPipeError:
+                    pass
+        else:
+            # Sub-agent: flush remaining partial line (if any).
+            if s["line_buffer"]:
+                tail = s["line_buffer"]
+                s["line_buffer"] = ""
+                try:
+                    sys.stderr.write(
+                        f"    \033[36m[{agent}]\033[0m \033[2m{tail}\033[0m\n"
+                    )
+                    sys.stderr.flush()
+                except BrokenPipeError:
+                    pass
+
+        _ = _t  # silence unused-import warning when timing unused
+        _reset(session_id)
+        return HookResult(action="continue")
+
+    async def _on_llm_stream_aborted(
+        _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        """SDK disconnect or mid-stream error. Mark visually; leave partial
+        plain text in scrollback as evidence of what was received."""
+        session_id = data.get("session_id") or ""
+        s = state.get(session_id)
+        if s is None or not s["painted"]:
+            return HookResult(action="continue")
+        try:
+            sys.stderr.write("\n\033[33m[stream interrupted]\033[0m\n")
+            sys.stderr.flush()
+        except BrokenPipeError:
+            pass
+        # No ANSI swap. Partial plain text stays. The next prompt is on a
+        # fresh line.
+        _reset(session_id)
+        return HookResult(action="continue")
+
+    async def _on_provider_retry(
+        _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        """Provider is retrying after a transient failure. Tell the user the
+        prior partial output was discarded; reset the accumulator so the
+        retry's deltas don't concatenate onto stale state."""
+        session_id = data.get("session_id") or ""
+        s = state.get(session_id)
+        if s is None or not s["painted"]:
+            return HookResult(action="continue")
+        try:
+            sys.stderr.write(
+                "\n\033[33m[retrying — previous partial output discarded]\033[0m\n"
+            )
+            sys.stderr.flush()
+        except BrokenPipeError:
+            pass
+        # Reset accumulator and sequence. Prior tokens stay in scrollback as
+        # evidence of what happened. The retry's deltas will paint below the
+        # marker as a fresh stream.
+        _reset(session_id)
+        return HookResult(action="continue")
+
+    async def _on_prompt_submit(
+        _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        """New turn. Wipe any leftover state so a misbehaving previous turn
+        can't poison this one."""
+        session_id = data.get("session_id") or ""
+        _reset(session_id)
+        return HookResult(action="continue")
+
+    return (
+        _on_content_block_delta,
+        _on_thinking_delta,
+        _on_content_block_stream_done,
+        _on_llm_stream_aborted,
+        _on_provider_retry,
+        _on_prompt_submit,
+    )
+
+
 def _make_cost_handler(coordinator):
     """Create the orchestrator:complete handler and its state.
 
@@ -794,4 +1342,5 @@ __all__ = [
     "mount",
     "StreamingUIHooks",
     "format_cost_usd",
+    "_make_streamed_flag_handlers",
 ]
