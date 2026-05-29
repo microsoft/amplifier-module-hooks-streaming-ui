@@ -17,6 +17,7 @@ from typing import Any
 
 from amplifier_core.models import HookResult
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 
 logger = logging.getLogger(__name__)
@@ -36,9 +37,11 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_token_usage = ui_config.get("show_token_usage", True)
 
     # Create hook handlers
-    hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage)
+    hooks = StreamingUIHooks(
+        show_thinking, show_tool_lines, show_token_usage, coordinator
+    )
 
-    # Register hooks on the coordinator
+    # Register atomic handlers (existing — unchanged in v2)
     coordinator.hooks.register(
         "content_block:start",
         hooks.handle_content_block_start,
@@ -64,23 +67,47 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
             "orchestrator:complete", _cost_handler, name="streaming-ui-cost-summary"
         )
 
-    # --- Token-level streaming renderer --------------------------------------
+    # --- v2 Transient Streaming Overlay --------------------------------------
     # Only register if stdout is a TTY. When piped or redirected, the CLI's
     # output is an API (`amplifier "x" > out.txt`); streamed tokens would be
     # unparseable noise. In non-TTY mode, no one sets streamed_this_turn,
     # the batch render at main.py:2800 fires normally, output stays clean.
+    #
+    # v2 model: each content block has a bounded transient region between
+    # content_block:start and content_block:end:
+    #   - Parent flavor: Rich Live(Markdown(buffer), transient=True). At end,
+    #     the Live closes (clearing the transient) and the streaming overlay
+    #     paints Markdown(buffer) inline for text blocks (decision B: instant
+    #     snap). Thinking blocks: just close Live, atomic renderer paints the
+    #     formatted block next.
+    #   - Sub-agent flavor: per-session line buffer. Each delta accumulates;
+    #     on newline, the complete line flushes atomically to stderr with
+    #     cyan [agent] dim styling. Multiple parallel sub-agents produce
+    #     non-interleaved prefixed lines. Existing atomic renderer paints
+    #     [agent] header + bordered block additively (decision D).
+    #
+    # The streaming overlay coexists with the existing atomic renderer
+    # (unchanged). The atomic renderer's whisper/rail intermediate-text
+    # path is skipped when streamed_this_turn is set so we don't double-
+    # render. Hook ordering: overlay registers AFTER atomic for content_block
+    # events, so it fires later (closes Live AFTER atomic decides whether to
+    # paint a formatted block). For content_block:end specifically we need
+    # overlay to fire FIRST (close Live before atomic paints) — achieved by
+    # explicit priority below.
     _is_tty = (
         sys.stdout.isatty()
         if hasattr(sys.stdout, "isatty")
         else False
     )
     if _is_tty:
-        # --- CR-1 streamed-flag plumbing -------------------------------------
+        # --- CR-1 streamed-flag plumbing (carries forward from v1) -----------
         # The CLI batch-renders each turn via render_message at main.py:2800.
         # When we paint tokens live, we suppress that batch render to avoid
         # double-output. The signal travels via coordinator.session_state, a
         # mutable dict observable from main.py between CLEANUP_RENDER_BEGIN
-        # (line 2795) and the render call (line 2800).
+        # (line 2795) and the render call (line 2800). The atomic renderer
+        # also reads this flag to skip its whisper/rail intermediate-text
+        # path (see handle_content_block_end).
         (
             _delta_h,
             _thinking_delta_h,
@@ -104,52 +131,65 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
             name="streaming-ui-flag-render-begin-noop",
         )
 
-        # --- Token painter ----------------------------------------------------
-        # Subscribes to content_block:delta, thinking:delta, content_block:
-        # stream_done, llm:stream_aborted, PROVIDER_RETRY. Per-session state
-        # (line buffer, accumulator, partial-escape pending) lives in the
-        # factory closure.
-        (
-            _r_delta_h,
-            _r_thinking_h,
-            _r_stream_done_h,
-            _r_aborted_h,
-            _r_retry_h,
-            _r_prompt_h,
-        ) = _make_streaming_renderer(coordinator)
+        # --- v2 Transient overlay handlers -----------------------------------
+        # Closure-captures state per session_id. State is per-block, indexed
+        # by (block_index). content_block:end fires the close, content_block:
+        # start fires the open, deltas update.
+        _overlay = _make_streaming_overlay()
+        coordinator.hooks.register(
+            "content_block:start",
+            _overlay["content_block:start"],
+            name="streaming-ui-overlay-start",
+        )
         coordinator.hooks.register(
             "content_block:delta",
-            _r_delta_h,
-            name="streaming-ui-renderer-delta",
+            _overlay["content_block:delta"],
+            name="streaming-ui-overlay-delta",
         )
         coordinator.hooks.register(
             "thinking:delta",
-            _r_thinking_h,
-            name="streaming-ui-renderer-thinking",
+            _overlay["thinking:delta"],
+            name="streaming-ui-overlay-thinking-delta",
         )
-        coordinator.hooks.register(
-            "content_block:stream_done",
-            _r_stream_done_h,
-            name="streaming-ui-renderer-stream-done",
-        )
+        # content_block:end overlay MUST fire before atomic so Live closes
+        # (clearing transient) before atomic paints the formatted block.
+        # Priority -10 sorts ahead of default (atomic registered above).
+        try:
+            coordinator.hooks.register(
+                "content_block:end",
+                _overlay["content_block:end"],
+                priority=-10,
+                name="streaming-ui-overlay-end",
+            )
+        except TypeError:
+            # Older HookRegistry without priority kwarg — fall back to
+            # registration-order semantics. Atomic is already registered so
+            # this overlay handler will fire AFTER atomic. Visual order may
+            # be slightly off (atomic formatted block paints, then transient
+            # clears below it) but no double-display.
+            coordinator.hooks.register(
+                "content_block:end",
+                _overlay["content_block:end"],
+                name="streaming-ui-overlay-end",
+            )
         coordinator.hooks.register(
             "llm:stream_aborted",
-            _r_aborted_h,
-            name="streaming-ui-renderer-aborted",
+            _overlay["llm:stream_aborted"],
+            name="streaming-ui-overlay-aborted",
         )
         coordinator.hooks.register(
             "provider:retry",
-            _r_retry_h,
-            name="streaming-ui-renderer-retry",
+            _overlay["provider:retry"],
+            name="streaming-ui-overlay-retry",
         )
         coordinator.hooks.register(
             "prompt:submit",
-            _r_prompt_h,
-            name="streaming-ui-renderer-prompt-reset",
+            _overlay["prompt:submit"],
+            name="streaming-ui-overlay-prompt-reset",
         )
 
     # Log successful mount
-    logger.info("Mounted hooks-streaming-ui (tty=%s)", _is_tty)
+    logger.info("Mounted hooks-streaming-ui (tty=%s) [v2]", _is_tty)
 
     return
 
@@ -158,7 +198,11 @@ class StreamingUIHooks:
     """Hooks for displaying streaming UI output."""
 
     def __init__(
-        self, show_thinking: bool, show_tool_lines: int, show_token_usage: bool
+        self,
+        show_thinking: bool,
+        show_tool_lines: int,
+        show_token_usage: bool,
+        coordinator: Any = None,
     ):
         """Initialize streaming UI hooks.
 
@@ -166,12 +210,36 @@ class StreamingUIHooks:
             show_thinking: Whether to display thinking blocks
             show_tool_lines: Number of lines to show for tool I/O
             show_token_usage: Whether to display token usage
+            coordinator: The amplifier coordinator instance. Used to read
+                `coordinator.session_state["streamed_this_turn"]` so the
+                atomic intermediate-text path can skip rendering when the
+                v2 transient overlay already painted that block.
         """
         self.show_thinking = show_thinking
         self.show_tool_lines = show_tool_lines
         self.show_token_usage = show_token_usage
+        self.coordinator = coordinator
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
+
+    def _was_streamed_this_turn(self) -> bool:
+        """Read the v2 streamed-this-turn flag from coordinator state.
+
+        Set by the streaming overlay when any content_block:delta or
+        thinking:delta fires (see _make_streamed_flag_handlers). Used by
+        handle_content_block_end's intermediate-text path to avoid
+        double-rendering content the overlay already painted.
+
+        Defensive: returns False if no coordinator was wired in or the
+        flag is missing.
+        """
+        coord = self.coordinator
+        if coord is None or not hasattr(coord, "session_state"):
+            return False
+        try:
+            return bool(coord.session_state.get("streamed_this_turn", False))
+        except Exception:
+            return False
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
@@ -374,7 +442,19 @@ class StreamingUIHooks:
         # Only render text that accompanies tool calls (not the final response).
         # The final response (last block when stop_reason=end_turn) is rendered
         # by the main response path at full brightness.
-        if block_type == "text" and not is_last_block and block.get("text", "").strip():
+        #
+        # v2: skip when the transient overlay already painted Markdown(buffer)
+        # for this block at content_block:end. Otherwise we double-render the
+        # same content (whisper/rail here PLUS Markdown from the overlay). The
+        # streamed flag is per-turn, set by the streaming overlay on first
+        # delta. Cleared at prompt:submit.
+        _v2_streamed = self._was_streamed_this_turn()
+        if (
+            block_type == "text"
+            and not is_last_block
+            and not _v2_streamed
+            and block.get("text", "").strip()
+        ):
             text = block["text"]
             indent = "    " if agent_name else ""
 
@@ -985,237 +1065,231 @@ def _parse_agent(session_id: str | None) -> str | None:
     parts = session_id.split("_", 1)
     return parts[1] if len(parts) == 2 else None
 
+def _make_streaming_overlay():
+    """v2 Transient Streaming Overlay (replaces v1 _make_streaming_renderer).
 
-def _make_streaming_renderer(coordinator):
-    """Create the six handlers that paint per-token streaming output and the
-    closure-captured state dict they share.
+    Per-block transient regions bounded by content_block:start and
+    content_block:end events. Two flavors based on session_id:
 
-    The factory pattern mirrors `_make_cost_handler` and
-    `_make_streamed_flag_handlers` above. State is per session_id so parallel
-    sub-agents don't trip over each other.
+    Parent flavor (session_id has no underscore-agent suffix):
+      - text / thinking blocks: Rich Live(Markdown(buffer), transient=True)
+        opened at content_block:start, updated on each delta, closed at
+        content_block:end. transient=True means Rich clears the Live region
+        on close. For text blocks, paint Markdown(buffer) inline after Live
+        closes (decision B: streaming overlay paints final, instant snap).
+        For thinking blocks: just close Live; the existing atomic renderer
+        paints the formatted bordered Thinking block next.
+      - tool_use blocks: print "Building tool call: <name>..." placeholder
+        at content_block:start. No Live region. The existing atomic flow
+        paints the formatted tool box via tool:pre/tool:post events later
+        (decision A: placeholder, not args streaming).
 
-    Returns: (
-        content_block_delta_handler,
-        thinking_delta_handler,
-        content_block_stream_done_handler,
-        llm_stream_aborted_handler,
-        provider_retry_handler,
-        prompt_submit_handler,
-    )
+    Sub-agent flavor (session_id matches `{parent}-{child}_{agent_name}`):
+      - text / thinking blocks: per-session line buffer. Each delta accumulates
+        into the buffer; on newline, the complete line flushes atomically to
+        stderr with cyan [agent] dim styling. Multiple parallel sub-agents
+        produce non-interleaved prefixed lines. The existing atomic renderer
+        paints [agent] header + bordered block ADDITIVELY (decision D: don't
+        clear streamed lines; let borders close around them).
+
+    Sanitizer (invariant 9): per-session stateful, holds partial escape
+    sequences across delta boundaries, strips ANSI control sequences and
+    Unicode bidi controls (Trojan Source CVE-2021-42574).
+
+    Returns a dict mapping event_name -> handler coroutine.
     """
-    # Per-session state. Each entry:
-    #   {
-    #     "accumulated":    str,    # parent: full text buffer for ANSI swap
-    #     "line_buffer":    str,    # sub-agent: pending partial line
-    #     "escape_pending": str,    # sanitizer carryover
-    #     "painted":        bool,   # any output written this turn?
-    #   }
-    state: dict[str, dict[str, Any]] = {}
-
-    # SIGWINCH tripwire. If the terminal resized mid-stream, our row math is
-    # stale and the swap will misalign. Capture the time of the last resize.
-    last_winch_ts: dict[str, float] = {"t": 0.0}
-
-    def _on_winch(_signum, _frame):
-        import time as _t
-
-        last_winch_ts["t"] = _t.time()
-
-    # signal.signal returns the previous handler (None if default). We don't
-    # restore it on unmount — mount happens once per process.
-    try:
-        signal.signal(signal.SIGWINCH, _on_winch)
-    except (ValueError, AttributeError, OSError):
-        # SIGWINCH unavailable (e.g. non-main thread, Windows). Without it
-        # we can't detect resize; the swap may misalign on resize. Acceptable
-        # degradation — falls into the "abandon swap, leave plain text" path.
-        pass
-
-    # Console for parent output (stdout) — used only for the final Markdown
-    # repaint. Console for stderr is built on demand inside handlers.
     parent_console = Console(file=sys.stdout, highlight=False)
 
-    def _get(session_id: str) -> dict[str, Any]:
-        s = state.get(session_id)
+    # state[session_id] = {
+    #     "agent": str | None,
+    #     "blocks": {block_index: {
+    #         "type": str,            # text | thinking | tool_use | ...
+    #         "buffer": str,          # accumulated sanitized text
+    #         "live": Live | None,    # parent flavor only
+    #         "escape_pending": str,  # sanitizer carryover across deltas
+    #         "name": str | None,     # tool_use block name
+    #     }},
+    # }
+    state: dict[str, dict[str, Any]] = {}
+
+    def _get_session(sid: str) -> dict[str, Any]:
+        s = state.get(sid)
         if s is None:
-            s = {
-                "accumulated": "",
-                "line_buffer": "",
-                "escape_pending": "",
-                "painted": False,
-                "stream_start_ts": 0.0,
-                "agent": _parse_agent(session_id),
-            }
-            state[session_id] = s
+            s = {"agent": _parse_agent(sid), "blocks": {}}
+            state[sid] = s
         return s
 
-    def _reset(session_id: str) -> None:
-        s = state.get(session_id)
+    def _close_live(block: dict[str, Any]) -> None:
+        live = block.get("live")
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
+            block["live"] = None
+
+    def _reset_session(sid: str) -> None:
+        s = state.get(sid)
         if s is None:
             return
-        s["accumulated"] = ""
-        s["line_buffer"] = ""
-        s["escape_pending"] = ""
-        s["painted"] = False
-        s["stream_start_ts"] = 0.0
+        for block in s["blocks"].values():
+            _close_live(block)
+        s["blocks"] = {}
 
-    async def _on_content_block_delta(
+    async def _on_content_block_start(
         _event: str, data: dict[str, Any]
     ) -> HookResult:
-        text = data.get("text", "")
+        sid = data.get("session_id") or ""
+        idx = data.get("block_index")
+        btype = data.get("block_type") or "text"
+        if idx is None:
+            return HookResult(action="continue")
+        s = _get_session(sid)
+        block: dict[str, Any] = {
+            "type": btype,
+            "buffer": "",
+            "live": None,
+            "escape_pending": "",
+            "name": data.get("name"),
+        }
+        s["blocks"][idx] = block
+        agent = s["agent"]
+
+        if agent is None:
+            # Parent flavor.
+            if btype == "tool_use":
+                # Decision A: placeholder, not args streaming.
+                name = data.get("name") or "tool"
+                try:
+                    parent_console.print(
+                        f"[dim]\U0001f527 Building tool call: {name}\u2026[/dim]"
+                    )
+                except BrokenPipeError:
+                    pass
+            elif btype in ("text", "thinking"):
+                # Open Rich Live region. transient=True means Rich clears
+                # the area when Live.stop() is called.
+                try:
+                    live = Live(
+                        Markdown(""),
+                        console=parent_console,
+                        transient=True,
+                        refresh_per_second=10,
+                    )
+                    live.start()
+                    block["live"] = live
+                except Exception:
+                    # If Live can't start, fall back to no transient
+                    # (delta handler will plain-print to stdout).
+                    block["live"] = None
+        # Sub-agent flavor: no setup needed at start. The line buffer
+        # is initialized as part of the block dict above.
+        return HookResult(action="continue")
+
+    async def _on_delta(event: str, data: dict[str, Any]) -> HookResult:
+        """Shared handler for content_block:delta AND thinking:delta. The
+        block_type was recorded at content_block:start; both delta event
+        types just append text to the relevant block's buffer."""
+        text = data.get("text") or ""
         if not text:
             return HookResult(action="continue")
+        sid = data.get("session_id") or ""
+        idx = data.get("block_index")
+        if idx is None:
+            return HookResult(action="continue")
+        s = _get_session(sid)
+        block = s["blocks"].get(idx)
+        if block is None:
+            # Delta without a matching start (shouldn't happen with v2
+            # provider but defensive). Synthesize a minimal block entry.
+            block = {
+                "type": "thinking" if event == "thinking:delta" else "text",
+                "buffer": "",
+                "live": None,
+                "escape_pending": "",
+                "name": None,
+            }
+            s["blocks"][idx] = block
 
-        session_id = data.get("session_id") or ""
-        s = _get(session_id)
-        clean, s["escape_pending"] = _sanitize_delta(text, s["escape_pending"])
+        clean, block["escape_pending"] = _sanitize_delta(
+            text, block["escape_pending"]
+        )
         if not clean:
             return HookResult(action="continue")
 
+        block["buffer"] += clean
         agent = s["agent"]
-        if agent is None:
-            # Parent: stream to stdout, accumulate for ANSI swap.
-            try:
-                sys.stdout.write(clean)
-                sys.stdout.flush()
-            except BrokenPipeError:
-                # Reader closed pipe (e.g. `amplifier "x" | head -1`). Drop
-                # subsequent paint silently; the streamed_this_turn flag
-                # already suppresses the batch render so the process can
-                # complete cleanly.
-                return HookResult(action="continue")
-            s["accumulated"] += clean
-            if not s["painted"]:
-                import time as _t
 
-                s["stream_start_ts"] = _t.time()
-            s["painted"] = True
-        else:
-            # Sub-agent: buffer to stderr line-by-line. Multiple sub-agents
-            # producing in parallel interleave at line granularity.
-            s["line_buffer"] += clean
-            while "\n" in s["line_buffer"]:
-                line, s["line_buffer"] = s["line_buffer"].split("\n", 1)
+        if agent is None:
+            # Parent: update Live with progressive Markdown.
+            live = block.get("live")
+            if live is not None:
                 try:
-                    # Cyan label + 4-space indent matches existing sub-agent
-                    # styling for thinking/tool (lines 194-201, 252-265).
+                    live.update(Markdown(block["buffer"]))
+                except Exception:
+                    pass
+            else:
+                # No Live opened (synthesized block / tool_use / Live
+                # failed to start). Plain-stdout fallback.
+                try:
+                    sys.stdout.write(clean)
+                    sys.stdout.flush()
+                except BrokenPipeError:
+                    pass
+        else:
+            # Sub-agent: line-buffered. Flush each complete line as
+            # an atomic write to stderr with [agent] cyan + dim styling.
+            while "\n" in block["buffer"]:
+                line, _, rest = block["buffer"].partition("\n")
+                block["buffer"] = rest
+                try:
                     sys.stderr.write(
                         f"    \033[36m[{agent}]\033[0m \033[2m{line}\033[0m\n"
                     )
                     sys.stderr.flush()
                 except BrokenPipeError:
-                    return HookResult(action="continue")
-            s["painted"] = True
-
+                    pass
         return HookResult(action="continue")
 
-    async def _on_thinking_delta(
+    async def _on_content_block_end(
         _event: str, data: dict[str, Any]
     ) -> HookResult:
-        text = data.get("text", "")
-        if not text:
+        sid = data.get("session_id") or ""
+        idx = data.get("block_index")
+        if idx is None:
             return HookResult(action="continue")
-
-        session_id = data.get("session_id") or ""
-        s = _get(session_id)
-        clean, s["escape_pending"] = _sanitize_delta(text, s["escape_pending"])
-        if not clean:
-            return HookResult(action="continue")
-
-        # Thinking always to stderr, dim. Parent has no indent; sub-agent
-        # gets the 4-space indent.
-        agent = s["agent"]
-        indent = "    " if agent else ""
-        prefix = f"[{agent}] " if agent else ""
-        try:
-            # Stream the clean text as-is. Newlines pass through; the dim
-            # styling is applied per write, not per line (acceptable
-            # smearing — thinking output is informational).
-            for line in clean.splitlines(keepends=True):
-                if line.endswith("\n"):
-                    body = line.rstrip("\n")
-                    sys.stderr.write(
-                        f"{indent}\033[2m{prefix}{body}\033[0m\n"
-                    )
-                else:
-                    sys.stderr.write(f"{indent}\033[2m{prefix}{line}\033[0m")
-            sys.stderr.flush()
-        except BrokenPipeError:
-            pass
-        s["painted"] = True
-
-        return HookResult(action="continue")
-
-    async def _on_content_block_stream_done(
-        _event: str, data: dict[str, Any]
-    ) -> HookResult:
-        """End of the model's stream. Trigger the ANSI swap for parent text
-        if it's safe; flush any sub-agent partial line."""
-        import time as _t
-
-        session_id = data.get("session_id") or ""
-        s = state.get(session_id)
-        if s is None:
+        s = _get_session(sid)
+        block = s["blocks"].get(idx)
+        if block is None:
             return HookResult(action="continue")
 
         agent = s["agent"]
+        btype = block["type"]
+        buffer = block["buffer"]
 
         if agent is None:
-            # Parent: attempt ANSI swap → final Markdown render.
-            full = s["accumulated"]
-            if not s["painted"] or not full:
-                _reset(session_id)
-                return HookResult(action="continue")
-
-            # Abandon swap if a SIGWINCH fired during the stream — the
-            # column width sampled when we computed wrap points is stale.
-            resized = last_winch_ts["t"] > s["stream_start_ts"]
-
-            # Abandon swap if TERM looks unreliable (no value, or "dumb").
-            term = os.environ.get("TERM", "")
-            term_ok = bool(term) and term not in ("dumb", "unknown")
-
-            if not resized and term_ok:
-                # Compute the exact number of terminal rows the streamed plain
-                # text occupied (wcwidth-aware via rich.console.render_lines).
+            # Parent: close Live first (clears the transient region).
+            _close_live(block)
+            if btype == "text" and buffer:
+                # Decision B: streaming overlay paints final Markdown inline.
+                # The transient just cleared; Markdown paints into the
+                # cleared area for an instant snap. The streamed_this_turn
+                # flag (set by _make_streamed_flag_handlers) causes
+                # main.py:2800 to skip render_message, avoiding double-paint.
                 try:
-                    rendered = parent_console.render_lines(
-                        Markdown(full), options=parent_console.options
-                    )
-                    plain_rows = len(rendered)
-                except Exception:
-                    plain_rows = 0
-
-                if plain_rows > 0:
-                    try:
-                        # Move up to start of streamed region, clear it,
-                        # repaint as Markdown.
-                        sys.stdout.write(f"\033[{plain_rows}A\033[J")
-                        sys.stdout.flush()
-                        parent_console.print(Markdown(full))
-                    except BrokenPipeError:
-                        pass
-                else:
-                    # Couldn't measure (degenerate input). Emit a newline so
-                    # the next prompt isn't crammed against the streamed text.
-                    try:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                    except BrokenPipeError:
-                        pass
-            else:
-                # Capability fallback: plain stays, just terminate with a
-                # newline so the next prompt isn't crammed.
-                try:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
+                    parent_console.print(Markdown(buffer))
                 except BrokenPipeError:
                     pass
+            # Thinking blocks: no inline paint. The existing atomic handler
+            # (handle_content_block_end on StreamingUIHooks) paints the
+            # formatted bordered Thinking block next.
+            # Tool_use blocks: no Live was opened; nothing to close. The
+            # tool:pre/tool:post flow handles the formatted box.
         else:
-            # Sub-agent: flush remaining partial line (if any).
-            if s["line_buffer"]:
-                tail = s["line_buffer"]
-                s["line_buffer"] = ""
+            # Sub-agent: flush any trailing partial line.
+            tail = buffer
+            block["buffer"] = ""
+            if tail:
                 try:
                     sys.stderr.write(
                         f"    \033[36m[{agent}]\033[0m \033[2m{tail}\033[0m\n"
@@ -1223,70 +1297,69 @@ def _make_streaming_renderer(coordinator):
                     sys.stderr.flush()
                 except BrokenPipeError:
                     pass
-
-        _ = _t  # silence unused-import warning when timing unused
-        _reset(session_id)
         return HookResult(action="continue")
 
     async def _on_llm_stream_aborted(
         _event: str, data: dict[str, Any]
     ) -> HookResult:
-        """SDK disconnect or mid-stream error. Mark visually; leave partial
-        plain text in scrollback as evidence of what was received."""
-        session_id = data.get("session_id") or ""
-        s = state.get(session_id)
-        if s is None or not s["painted"]:
+        sid = data.get("session_id") or ""
+        s = state.get(sid)
+        if s is None:
             return HookResult(action="continue")
-        try:
-            sys.stderr.write("\n\033[33m[stream interrupted]\033[0m\n")
-            sys.stderr.flush()
-        except BrokenPipeError:
-            pass
-        # No ANSI swap. Partial plain text stays. The next prompt is on a
-        # fresh line.
-        _reset(session_id)
+        any_painted = any(
+            block.get("buffer") for block in s["blocks"].values()
+        )
+        for block in s["blocks"].values():
+            _close_live(block)
+        if any_painted:
+            try:
+                sys.stderr.write("\n\033[33m[stream interrupted]\033[0m\n")
+                sys.stderr.flush()
+            except BrokenPipeError:
+                pass
+        s["blocks"] = {}
         return HookResult(action="continue")
 
     async def _on_provider_retry(
         _event: str, data: dict[str, Any]
     ) -> HookResult:
-        """Provider is retrying after a transient failure. Tell the user the
-        prior partial output was discarded; reset the accumulator so the
-        retry's deltas don't concatenate onto stale state."""
-        session_id = data.get("session_id") or ""
-        s = state.get(session_id)
-        if s is None or not s["painted"]:
+        sid = data.get("session_id") or ""
+        s = state.get(sid)
+        if s is None:
             return HookResult(action="continue")
-        try:
-            sys.stderr.write(
-                "\n\033[33m[retrying — previous partial output discarded]\033[0m\n"
-            )
-            sys.stderr.flush()
-        except BrokenPipeError:
-            pass
-        # Reset accumulator and sequence. Prior tokens stay in scrollback as
-        # evidence of what happened. The retry's deltas will paint below the
-        # marker as a fresh stream.
-        _reset(session_id)
+        any_painted = any(
+            block.get("buffer") for block in s["blocks"].values()
+        )
+        for block in s["blocks"].values():
+            _close_live(block)
+        if any_painted:
+            try:
+                sys.stderr.write(
+                    "\n\033[33m[retrying \u2014 previous partial output discarded]\033[0m\n"
+                )
+                sys.stderr.flush()
+            except BrokenPipeError:
+                pass
+        s["blocks"] = {}
         return HookResult(action="continue")
 
     async def _on_prompt_submit(
         _event: str, data: dict[str, Any]
     ) -> HookResult:
-        """New turn. Wipe any leftover state so a misbehaving previous turn
-        can't poison this one."""
-        session_id = data.get("session_id") or ""
-        _reset(session_id)
+        sid = data.get("session_id") or ""
+        _reset_session(sid)
         return HookResult(action="continue")
 
-    return (
-        _on_content_block_delta,
-        _on_thinking_delta,
-        _on_content_block_stream_done,
-        _on_llm_stream_aborted,
-        _on_provider_retry,
-        _on_prompt_submit,
-    )
+    return {
+        "content_block:start": _on_content_block_start,
+        "content_block:delta": _on_delta,
+        "thinking:delta": _on_delta,
+        "content_block:end": _on_content_block_end,
+        "llm:stream_aborted": _on_llm_stream_aborted,
+        "provider:retry": _on_provider_retry,
+        "prompt:submit": _on_prompt_submit,
+    }
+
 
 
 def _make_cost_handler(coordinator):
