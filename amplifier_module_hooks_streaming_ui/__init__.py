@@ -37,9 +37,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_token_usage = ui_config.get("show_token_usage", True)
 
     # Create hook handlers
-    hooks = StreamingUIHooks(
-        show_thinking, show_tool_lines, show_token_usage, coordinator
-    )
+    hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage)
 
     # Register atomic handlers (existing — unchanged in v2)
     coordinator.hooks.register(
@@ -67,111 +65,57 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
             "orchestrator:complete", _cost_handler, name="streaming-ui-cost-summary"
         )
 
-    # --- v2 Transient Streaming Overlay --------------------------------------
+    # --- v3 Transient Streaming Overlay --------------------------------------
     # Only register if stdout is a TTY. When piped or redirected, the CLI's
     # output is an API (`amplifier "x" > out.txt`); streamed tokens would be
-    # unparseable noise. In non-TTY mode, no one sets streamed_this_turn,
-    # the batch render at main.py:2800 fires normally, output stays clean.
+    # unparseable noise. In non-TTY mode, the batch render at main.py fires
+    # normally and output stays clean.
     #
-    # v2 model: each content block has a bounded transient region between
-    # content_block:start and content_block:end:
-    #   - Parent flavor: Rich Live(Markdown(buffer), transient=True). At end,
-    #     the Live closes (clearing the transient) and the streaming overlay
-    #     paints Markdown(buffer) inline for text blocks (decision B: instant
-    #     snap). Thinking blocks: just close Live, atomic renderer paints the
-    #     formatted block next.
+    # v3 model: separate event channels for streaming lifecycle vs atomic.
+    #   Overlay subscribes to llm:stream_* events (provider streaming lifecycle).
+    #   Atomic renderer subscribes to content_block:* events (synthesized by
+    #   loop-streaming from assembled response). No shared payload contract.
+    #
+    #   - Parent flavor: Rich Live(Markdown(buffer), transient=True). Live opens
+    #     on llm:stream_block_start, updates on deltas, closes on
+    #     llm:stream_block_end. Atomic renderer handles final display via
+    #     content_block:end from loop-streaming.
     #   - Sub-agent flavor: per-session line buffer. Each delta accumulates;
     #     on newline, the complete line flushes atomically to stderr with
     #     cyan [agent] dim styling. Multiple parallel sub-agents produce
-    #     non-interleaved prefixed lines. Existing atomic renderer paints
-    #     [agent] header + bordered block additively (decision D).
-    #
-    # The streaming overlay coexists with the existing atomic renderer
-    # (unchanged). The atomic renderer's whisper/rail intermediate-text
-    # path is skipped when streamed_this_turn is set so we don't double-
-    # render. Hook ordering: overlay registers AFTER atomic for content_block
-    # events, so it fires later (closes Live AFTER atomic decides whether to
-    # paint a formatted block). For content_block:end specifically we need
-    # overlay to fire FIRST (close Live before atomic paints) — achieved by
-    # explicit priority below.
+    #     non-interleaved prefixed lines. Atomic renderer paints bordered block.
     _is_tty = (
         sys.stdout.isatty()
         if hasattr(sys.stdout, "isatty")
         else False
     )
     if _is_tty:
-        # --- CR-1 streamed-flag plumbing (carries forward from v1) -----------
-        # The CLI batch-renders each turn via render_message at main.py:2800.
-        # When we paint tokens live, we suppress that batch render to avoid
-        # double-output. The signal travels via coordinator.session_state, a
-        # mutable dict observable from main.py between CLEANUP_RENDER_BEGIN
-        # (line 2795) and the render call (line 2800). The atomic renderer
-        # also reads this flag to skip its whisper/rail intermediate-text
-        # path (see handle_content_block_end).
-        (
-            _delta_h,
-            _thinking_delta_h,
-            _prompt_submit_h,
-            _render_begin_h,
-        ) = _make_streamed_flag_handlers(coordinator)
-        coordinator.hooks.register(
-            "content_block:delta", _delta_h, name="streaming-ui-flag-delta"
-        )
-        coordinator.hooks.register(
-            "thinking:delta",
-            _thinking_delta_h,
-            name="streaming-ui-flag-thinking-delta",
-        )
-        coordinator.hooks.register(
-            "prompt:submit", _prompt_submit_h, name="streaming-ui-flag-reset"
-        )
-        coordinator.hooks.register(
-            "cleanup:render_begin",
-            _render_begin_h,
-            name="streaming-ui-flag-render-begin-noop",
-        )
-
-        # --- v2 Transient overlay handlers -----------------------------------
-        # Closure-captures state per session_id. State is per-block, indexed
-        # by (block_index). content_block:end fires the close, content_block:
-        # start fires the open, deltas update.
+        # --- v3 Transient overlay handlers -----------------------------------
+        # Subscribes to llm:stream_* events (provider streaming lifecycle),
+        # NOT content_block:* events (synthesized by loop-streaming).
+        # This separation means the overlay and atomic renderer are on
+        # independent event channels — no shared payload-field contract.
         _overlay = _make_streaming_overlay()
         coordinator.hooks.register(
-            "content_block:start",
-            _overlay["content_block:start"],
+            "llm:stream_block_start",
+            _overlay["llm:stream_block_start"],
             name="streaming-ui-overlay-start",
         )
         coordinator.hooks.register(
-            "content_block:delta",
-            _overlay["content_block:delta"],
+            "llm:stream_block_delta",
+            _overlay["llm:stream_block_delta"],
             name="streaming-ui-overlay-delta",
         )
         coordinator.hooks.register(
-            "thinking:delta",
-            _overlay["thinking:delta"],
+            "llm:stream_thinking_delta",
+            _overlay["llm:stream_thinking_delta"],
             name="streaming-ui-overlay-thinking-delta",
         )
-        # content_block:end overlay MUST fire before atomic so Live closes
-        # (clearing transient) before atomic paints the formatted block.
-        # Priority -10 sorts ahead of default (atomic registered above).
-        try:
-            coordinator.hooks.register(
-                "content_block:end",
-                _overlay["content_block:end"],
-                priority=-10,
-                name="streaming-ui-overlay-end",
-            )
-        except TypeError:
-            # Older HookRegistry without priority kwarg — fall back to
-            # registration-order semantics. Atomic is already registered so
-            # this overlay handler will fire AFTER atomic. Visual order may
-            # be slightly off (atomic formatted block paints, then transient
-            # clears below it) but no double-display.
-            coordinator.hooks.register(
-                "content_block:end",
-                _overlay["content_block:end"],
-                name="streaming-ui-overlay-end",
-            )
+        coordinator.hooks.register(
+            "llm:stream_block_end",
+            _overlay["llm:stream_block_end"],
+            name="streaming-ui-overlay-end",
+        )
         coordinator.hooks.register(
             "llm:stream_aborted",
             _overlay["llm:stream_aborted"],
@@ -189,7 +133,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         )
 
     # Log successful mount
-    logger.info("Mounted hooks-streaming-ui (tty=%s) [v2]", _is_tty)
+    logger.info("Mounted hooks-streaming-ui (tty=%s) [v3]", _is_tty)
 
     return
 
@@ -202,7 +146,6 @@ class StreamingUIHooks:
         show_thinking: bool,
         show_tool_lines: int,
         show_token_usage: bool,
-        coordinator: Any = None,
     ):
         """Initialize streaming UI hooks.
 
@@ -210,36 +153,12 @@ class StreamingUIHooks:
             show_thinking: Whether to display thinking blocks
             show_tool_lines: Number of lines to show for tool I/O
             show_token_usage: Whether to display token usage
-            coordinator: The amplifier coordinator instance. Used to read
-                `coordinator.session_state["streamed_this_turn"]` so the
-                atomic intermediate-text path can skip rendering when the
-                v2 transient overlay already painted that block.
         """
         self.show_thinking = show_thinking
         self.show_tool_lines = show_tool_lines
         self.show_token_usage = show_token_usage
-        self.coordinator = coordinator
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
-
-    def _was_streamed_this_turn(self) -> bool:
-        """Read the v2 streamed-this-turn flag from coordinator state.
-
-        Set by the streaming overlay when any content_block:delta or
-        thinking:delta fires (see _make_streamed_flag_handlers). Used by
-        handle_content_block_end's intermediate-text path to avoid
-        double-rendering content the overlay already painted.
-
-        Defensive: returns False if no coordinator was wired in or the
-        flag is missing.
-        """
-        coord = self.coordinator
-        if coord is None or not hasattr(coord, "session_state"):
-            return False
-        try:
-            return bool(coord.session_state.get("streamed_this_turn", False))
-        except Exception:
-            return False
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
@@ -443,16 +362,11 @@ class StreamingUIHooks:
         # The final response (last block when stop_reason=end_turn) is rendered
         # by the main response path at full brightness.
         #
-        # v2: skip when the transient overlay already painted Markdown(buffer)
-        # for this block at content_block:end. Otherwise we double-render the
-        # same content (whisper/rail here PLUS Markdown from the overlay). The
-        # streamed flag is per-turn, set by the streaming overlay on first
-        # delta. Cleared at prompt:submit.
-        _v2_streamed = self._was_streamed_this_turn()
+        # v3: no streaming suppression here. The overlay no longer paints
+        # Markdown for text blocks, so there is no double-render risk.
         if (
             block_type == "text"
             and not is_last_block
-            and not _v2_streamed
             and block.get("text", "").strip()
         ):
             text = block["text"]
@@ -909,54 +823,6 @@ def _sum_cost_usd(contributions: list) -> Decimal | None:
     return total
 
 
-def _make_streamed_flag_handlers(coordinator):
-    """Create the four handlers that maintain the per-turn `streamed_this_turn`
-    flag used to suppress the CLI's batch render when we painted tokens live.
-
-    Returns (delta_handler, thinking_delta_handler, prompt_submit_handler,
-    render_begin_handler) — all closures that capture `coordinator` and mutate
-    `coordinator.session_state["streamed_this_turn"]`.
-
-    Lifecycle:
-      prompt:submit          → clear flag (new turn begins)
-      content_block:delta    → set flag (text streamed)
-      thinking:delta         → set flag (thinking streamed)
-      cleanup:render_begin   → no-op; flag is read by main.py:2797 before
-                               the batch render at line 2800. Registering a
-                               handler is optional, but it guarantees the
-                               event has subscribers (some observability
-                               assertions depend on this).
-
-    Closure-capture pattern matches `_make_cost_handler` below.
-    """
-
-    async def _on_content_block_delta(
-        _event: str, _data: dict[str, Any]
-    ) -> HookResult:
-        coordinator.session_state["streamed_this_turn"] = True
-        return HookResult(action="continue")
-
-    async def _on_thinking_delta(_event: str, _data: dict[str, Any]) -> HookResult:
-        coordinator.session_state["streamed_this_turn"] = True
-        return HookResult(action="continue")
-
-    async def _on_prompt_submit(_event: str, _data: dict[str, Any]) -> HookResult:
-        coordinator.session_state["streamed_this_turn"] = False
-        return HookResult(action="continue")
-
-    async def _on_cleanup_render_begin(
-        _event: str, _data: dict[str, Any]
-    ) -> HookResult:
-        # Observability-only no-op. The flag READ happens in main.py:2797.
-        return HookResult(action="continue")
-
-    return (
-        _on_content_block_delta,
-        _on_thinking_delta,
-        _on_prompt_submit,
-        _on_cleanup_render_begin,
-    )
-
 
 # =============================================================================
 # Token-level streaming renderer
@@ -1066,23 +932,22 @@ def _parse_agent(session_id: str | None) -> str | None:
     return parts[1] if len(parts) == 2 else None
 
 def _make_streaming_overlay():
-    """v2 Transient Streaming Overlay (replaces v1 _make_streaming_renderer).
+    """v3 Transient Streaming Overlay.
 
-    Per-block transient regions bounded by content_block:start and
-    content_block:end events. Two flavors based on session_id:
+    Per-block transient regions bounded by llm:stream_block_start and
+    llm:stream_block_end events (provider streaming lifecycle channel).
+    Completely separate from content_block:start/end (atomic renderer's
+    channel, synthesized by loop-streaming). Two flavors based on session_id:
 
     Parent flavor (session_id has no underscore-agent suffix):
       - text / thinking blocks: Rich Live(Markdown(buffer), transient=True)
-        opened at content_block:start, updated on each delta, closed at
-        content_block:end. transient=True means Rich clears the Live region
-        on close. For text blocks, paint Markdown(buffer) inline after Live
-        closes (decision B: streaming overlay paints final, instant snap).
-        For thinking blocks: just close Live; the existing atomic renderer
-        paints the formatted bordered Thinking block next.
+        opened at llm:stream_block_start, updated on deltas, closed at
+        llm:stream_block_end. transient=True means Rich clears the Live region
+        on close. Final display handled by the atomic renderer via
+        content_block:end (from loop-streaming with full assembled payload).
       - tool_use blocks: print "Building tool call: <name>..." placeholder
-        at content_block:start. No Live region. The existing atomic flow
-        paints the formatted tool box via tool:pre/tool:post events later
-        (decision A: placeholder, not args streaming).
+        at llm:stream_block_start. No Live region. The existing atomic flow
+        paints the formatted tool box via tool:pre/tool:post events later.
 
     Sub-agent flavor (session_id matches `{parent}-{child}_{agent_name}`):
       - text / thinking blocks: per-session line buffer. Each delta accumulates
@@ -1187,8 +1052,8 @@ def _make_streaming_overlay():
         return HookResult(action="continue")
 
     async def _on_delta(event: str, data: dict[str, Any]) -> HookResult:
-        """Shared handler for content_block:delta AND thinking:delta. The
-        block_type was recorded at content_block:start; both delta event
+        """Shared handler for llm:stream_block_delta AND llm:stream_thinking_delta.
+        The block_type was recorded at llm:stream_block_start; both delta event
         types just append text to the relevant block's buffer."""
         text = data.get("text") or ""
         if not text:
@@ -1200,10 +1065,10 @@ def _make_streaming_overlay():
         s = _get_session(sid)
         block = s["blocks"].get(idx)
         if block is None:
-            # Delta without a matching start (shouldn't happen with v2
-            # provider but defensive). Synthesize a minimal block entry.
+            # Delta without a matching start (shouldn't happen but defensive).
+            # Synthesize a minimal block entry.
             block = {
-                "type": "thinking" if event == "thinking:delta" else "text",
+                "type": "thinking" if event == "llm:stream_thinking_delta" else "text",
                 "buffer": "",
                 "live": None,
                 "escape_pending": "",
@@ -1264,25 +1129,17 @@ def _make_streaming_overlay():
             return HookResult(action="continue")
 
         agent = s["agent"]
-        btype = block["type"]
         buffer = block["buffer"]
 
         if agent is None:
-            # Parent: close Live first (clears the transient region).
+            # Parent: close Live (clears the transient region).
+            # v3: no inline Markdown paint here. The atomic renderer
+            # (handle_content_block_end on StreamingUIHooks, triggered by
+            # loop-streaming's content_block:end synthesis) handles final
+            # display. The overlay's job is only to manage the Live region.
             _close_live(block)
-            if btype == "text" and buffer:
-                # Decision B: streaming overlay paints final Markdown inline.
-                # The transient just cleared; Markdown paints into the
-                # cleared area for an instant snap. The streamed_this_turn
-                # flag (set by _make_streamed_flag_handlers) causes
-                # main.py:2800 to skip render_message, avoiding double-paint.
-                try:
-                    parent_console.print(Markdown(buffer))
-                except BrokenPipeError:
-                    pass
-            # Thinking blocks: no inline paint. The existing atomic handler
-            # (handle_content_block_end on StreamingUIHooks) paints the
-            # formatted bordered Thinking block next.
+            # Thinking blocks: no inline paint. Atomic handler paints the
+            # formatted bordered Thinking block via content_block:end.
             # Tool_use blocks: no Live was opened; nothing to close. The
             # tool:pre/tool:post flow handles the formatted box.
         else:
@@ -1351,10 +1208,10 @@ def _make_streaming_overlay():
         return HookResult(action="continue")
 
     return {
-        "content_block:start": _on_content_block_start,
-        "content_block:delta": _on_delta,
-        "thinking:delta": _on_delta,
-        "content_block:end": _on_content_block_end,
+        "llm:stream_block_start": _on_content_block_start,
+        "llm:stream_block_delta": _on_delta,
+        "llm:stream_thinking_delta": _on_delta,
+        "llm:stream_block_end": _on_content_block_end,
         "llm:stream_aborted": _on_llm_stream_aborted,
         "provider:retry": _on_provider_retry,
         "prompt:submit": _on_prompt_submit,
@@ -1415,5 +1272,4 @@ __all__ = [
     "mount",
     "StreamingUIHooks",
     "format_cost_usd",
-    "_make_streamed_flag_handlers",
 ]
