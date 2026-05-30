@@ -951,6 +951,25 @@ def _tail_buffer(buf: str, max_lines: int) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+
+def _manual_clear_region(rows: int) -> None:
+    """Deterministically clear `rows` lines ending at the current cursor
+    position. Used instead of Rich Live transient=True, whose CPR-based
+    clear leaves leftover rows on terminals that don't answer cursor-
+    position requests.
+
+    Called after live.stop() when Live is constructed with transient=False.
+    We compute the row count from the tailed buffer ourselves, so the clear
+    is independent of Rich's cursor-position detection.
+    """
+    if rows <= 0:
+        return
+    try:
+        sys.stdout.write(f"\x1b[{rows}A\x1b[0J")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+
 def _make_streaming_overlay():
     """v3 Transient Streaming Overlay.
 
@@ -960,10 +979,11 @@ def _make_streaming_overlay():
     channel, synthesized by loop-streaming). Two flavors based on session_id:
 
     Parent flavor (session_id has no underscore-agent suffix):
-      - text / thinking blocks: Rich Live(Markdown(buffer), transient=True)
+      - text / thinking blocks: Rich Live(Markdown(buffer), transient=False)
         opened at llm:stream_block_start, updated on deltas, closed at
-        llm:stream_block_end. transient=True means Rich clears the Live region
-        on close. Final display handled by the atomic renderer via
+        llm:stream_block_end. transient=False + _manual_clear_region() gives
+        deterministic clearing independent of Rich's CPR-based auto-clear.
+        Final display handled by the atomic renderer via
         content_block:end (from loop-streaming with full assembled payload).
       - tool_use blocks: print "Building tool call: <name>..." placeholder
         at llm:stream_block_start. No Live region. The existing atomic flow
@@ -991,6 +1011,7 @@ def _make_streaming_overlay():
     #         "type": str,            # text | thinking | tool_use | ...
     #         "buffer": str,          # accumulated sanitized text
     #         "live": Live | None,    # parent flavor only
+    #         "live_rows": int,       # rendered row count for manual clear
     #         "escape_pending": str,  # sanitizer carryover across deltas
     #         "name": str | None,     # tool_use block name
     #     }},
@@ -1011,6 +1032,10 @@ def _make_streaming_overlay():
                 live.stop()
             except Exception:
                 pass
+            # Manually clear the region: transient=False means Rich won't
+            # auto-clear on stop(). We do it ourselves using the rendered
+            # row count tracked during live.update() calls.
+            _manual_clear_region(block.get("live_rows", 0))
             block["live"] = None
 
     def _reset_session(sid: str) -> None:
@@ -1034,6 +1059,7 @@ def _make_streaming_overlay():
             "type": btype,
             "buffer": "",
             "live": None,
+            "live_rows": 0,  # rendered row count for manual clear
             "escape_pending": "",
             "name": data.get("name"),
         }
@@ -1052,13 +1078,14 @@ def _make_streaming_overlay():
                 except BrokenPipeError:
                     pass
             elif btype in ("text", "thinking"):
-                # Open Rich Live region. transient=True means Rich clears
-                # the area when Live.stop() is called.
+                # Open Rich Live region. transient=False: we clear
+                # the area ourselves via _manual_clear_region() to avoid
+                # Rich's CPR-dependent transient clearing.
                 try:
                     live = Live(
                         Markdown(""),
                         console=parent_console,
-                        transient=True,
+                        transient=False,
                         refresh_per_second=10,
                     )
                     live.start()
@@ -1108,14 +1135,23 @@ def _make_streaming_overlay():
         if agent is None:
             # Parent: update Live with progressive Markdown.
             # Cap to terminal height minus a small reserve so Live's
-            # rendered area never exceeds visible rows. transient=True
-            # can only clean what's currently visible — overflow scrolls
-            # into scrollback and survives Live.stop() as ghost text.
+            # rendered area never exceeds visible rows. Track the rendered
+            # row count for the manual clear on live.stop().
             live = block.get("live")
             if live is not None:
                 try:
                     max_lines = max(5, parent_console.size.height - 5)
-                    live.update(Markdown(_tail_buffer(block["buffer"], max_lines)))
+                    tailed = _tail_buffer(block["buffer"], max_lines)
+                    md = Markdown(tailed)
+                    live.update(md)
+                    try:
+                        block["live_rows"] = len(
+                            parent_console.render_lines(md, pad=False)
+                        )
+                    except Exception:
+                        # render_lines unavailable (e.g. mock console);
+                        # fall back to newline count as approximation.
+                        block["live_rows"] = max(1, tailed.count("\n") + 1)
                 except Exception:
                     pass
             else:
