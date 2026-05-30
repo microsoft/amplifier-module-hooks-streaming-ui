@@ -328,9 +328,14 @@ class StreamingUIHooks:
                 )
                 sys.stderr.flush()
             else:
-                # Parent thinking: status line cyan
-                sys.stderr.write("\n\033[36m🧠 Thinking...\033[0m\n")
-                sys.stderr.flush()
+                # Parent thinking: status line cyan.
+                # Skip when the overlay is active — the overlay already shows a
+                # live framed preview during streaming, so this status fires
+                # AFTER the thinking block has been painted (at content_block:start
+                # which arrives after llm:stream_block_end) and appears misplaced.
+                if not self.overlay_active:
+                    sys.stderr.write("\n\033[36m🧠 Thinking...\033[0m\n")
+                    sys.stderr.flush()
 
         return HookResult(action="continue")
 
@@ -524,6 +529,7 @@ class StreamingUIHooks:
                 except Exception:
                     cost_part = " | Cost: ?"
 
+            print()  # blank line separates Token Usage from preceding content
             print(f"{indent}\033[2m│  {header}\033[0m")
             print(
                 f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
@@ -985,14 +991,9 @@ def _parse_agent(session_id: str | None) -> str | None:
 def _tail_buffer(buf: str, max_lines: int) -> str:
     """Return only the last max_lines lines of buf.
 
-    Used to keep the Rich Live region bounded by terminal height. When the
-    streaming buffer's rendered height exceeds the terminal's visible rows,
-    overflow content scrolls off Live's visible area and survives
-    Live.stop()(transient=True) cleanup as ghost text in scrollback. Capping
-    what Live sees to (terminal_height - reserve) prevents the overflow.
-
-    The internal buffer keeps growing for correctness; only the slice shown
-    to Live is trimmed.
+    Used as a fallback raw-line cap when rendered-height measurement is
+    unavailable (e.g. mock consoles in tests).  The internal buffer keeps
+    growing for correctness; only the slice shown to Live is trimmed.
     """
     if max_lines <= 0:
         return buf
@@ -1000,6 +1001,73 @@ def _tail_buffer(buf: str, max_lines: int) -> str:
     if len(lines) <= max_lines:
         return buf
     return "\n".join(lines[-max_lines:])
+
+
+def _fit_tail_to_height(
+    buffer: str,
+    budget_rows: int,
+    render_fn: Any,
+    console: Any,
+) -> str:
+    """Return the largest trailing slice of *buffer* whose RENDERED height
+    (``render_fn(slice)`` measured on *console*) is <= *budget_rows*.
+
+    Raw newline count is not a reliable proxy for rendered height: Rich
+    Markdown expands plain text into more terminal rows through word-wrapping,
+    list indentation, heading padding, and code-block borders.  Capping by
+    raw lines alone lets long blocks overflow Rich's Live region → Live.stop()
+    can only erase what's still on screen → scrolled-off rows survive as ghost
+    text.
+
+    Algorithm:
+        1. Render the full buffer; if it fits, return it immediately.
+        2. Otherwise start from the raw-line-cap tail as an upper bound and
+           advance the start index by the measured excess on each iteration
+           (aggressive drop keeps the loop short in practice).
+        3. Fall back to :func:`_tail_buffer` if *console* doesn't implement
+           ``render_lines`` (e.g. mock consoles in tests).
+
+    Args:
+        buffer:      Full accumulated streaming text.
+        budget_rows: Maximum number of rendered terminal rows allowed.
+        render_fn:   Callable ``(text: str) -> Rich renderable`` — e.g.
+                     ``Markdown`` or ``lambda t: _thinking_renderable(t, width=w)``.
+        console:     The Rich Console whose ``render_lines`` measures height.
+
+    Returns:
+        A trailing slice of *buffer* that renders within *budget_rows*.
+    """
+    if not buffer or budget_rows <= 0:
+        return buffer
+
+    lines = buffer.split("\n")
+    n = len(lines)
+
+    try:
+        # Fast path: full buffer already fits.
+        full_height = len(console.render_lines(render_fn(buffer), pad=False))
+        if full_height <= budget_rows:
+            return buffer
+
+        # Start from where the raw-line cap would land (a reasonable upper bound
+        # since rendered lines >= raw lines).  Then advance by the measured excess
+        # to converge quickly without an O(n²) linear scan.
+        start = max(0, n - budget_rows)
+        while start < n - 1:
+            tail = "\n".join(lines[start:])
+            height = len(console.render_lines(render_fn(tail), pad=False))
+            if height <= budget_rows:
+                return tail
+            # Advance by the overage — drops at least 1 line per iteration.
+            start += max(1, height - budget_rows)
+
+        # Last resort: single tail line.
+        return lines[-1] if lines else buffer
+
+    except Exception:
+        # Console doesn't support render_lines (mock) or other failure.
+        # Fall back to raw-line capping so existing tests are unaffected.
+        return _tail_buffer(buffer, budget_rows)
 
 
 def _thinking_renderable(
@@ -1234,12 +1302,27 @@ def _make_streaming_overlay():
                         except Exception:
                             console_height = 24
                             console_width = 80
-                        max_lines = max(5, console_height - 5 - 4)
-                        tail = _tail_buffer(block["buffer"], max_lines)
+                        budget = max(5, console_height - 5 - 4)
+                        tail = _fit_tail_to_height(
+                            block["buffer"],
+                            budget,
+                            lambda t: _thinking_renderable(t, width=console_width),
+                            parent_console,
+                        )
                         live.update(_thinking_renderable(tail, width=console_width))
                     else:
-                        max_lines = max(5, parent_console.size.height - 5)
-                        live.update(Markdown(_tail_buffer(block["buffer"], max_lines)))
+                        try:
+                            text_height = parent_console.size.height
+                        except Exception:
+                            text_height = 24
+                        budget = max(5, text_height - 5)
+                        tail = _fit_tail_to_height(
+                            block["buffer"],
+                            budget,
+                            Markdown,
+                            parent_console,
+                        )
+                        live.update(Markdown(tail))
                 except Exception:
                     pass
             else:
