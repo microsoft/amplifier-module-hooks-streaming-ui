@@ -83,15 +83,13 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
 
     # Determine overlay state up front so the atomic renderer can skip
     # thinking re-paints that the overlay already owns.
-    _is_tty = (
-        sys.stdout.isatty()
-        if hasattr(sys.stdout, "isatty")
-        else False
-    )
+    _is_tty = sys.stdout.isatty() if hasattr(sys.stdout, "isatty") else False
     overlay_active = _is_tty and stream_tokens
 
     # Create hook handlers
-    hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage, overlay_active=overlay_active)
+    hooks = StreamingUIHooks(
+        show_thinking, show_tool_lines, show_token_usage, overlay_active=overlay_active
+    )
 
     # Register atomic handlers (existing — unchanged in v2)
     coordinator.hooks.register(
@@ -114,9 +112,19 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         "llm:response", hooks.handle_llm_response, name="streaming-ui-llm-response"
     )
     if show_token_usage:
-        _cost_handler, _ = _make_cost_handler(coordinator)
+        _cost_handler, _ = _make_cost_handler(coordinator, hooks=hooks)
         coordinator.hooks.register(
             "orchestrator:complete", _cost_handler, name="streaming-ui-cost-summary"
+        )
+
+    # Register the deferred-flush handler on cleanup:render_end when the overlay
+    # is active.  app-cli emits this event immediately after render_message paints
+    # the final response, so Token Usage + cost land below the response text.
+    if overlay_active:
+        coordinator.hooks.register(
+            "cleanup:render_end",
+            hooks.handle_render_end,
+            name="streaming-ui-render-end",
         )
 
     # --- v3 Transient Streaming Overlay --------------------------------------
@@ -184,7 +192,11 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         )
 
     # Log successful mount
-    logger.info("Mounted hooks-streaming-ui (tty=%s, stream_tokens=%s) [v3]", _is_tty, stream_tokens)
+    logger.info(
+        "Mounted hooks-streaming-ui (tty=%s, stream_tokens=%s) [v3]",
+        _is_tty,
+        stream_tokens,
+    )
 
     return
 
@@ -216,6 +228,14 @@ class StreamingUIHooks:
         self.overlay_active = overlay_active
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
+        # Deferred display state (overlay-active path only):
+        # When overlay is on and the final response is a text block, Token Usage
+        # and the turn cost line are stashed here instead of printed inline on
+        # content_block:end / orchestrator:complete.  They flush on
+        # cleanup:render_end (emitted by app-cli after render_message), so they
+        # appear BELOW the rendered response rather than inserting above it.
+        self._deferred_usage: tuple[str, str] | None = None  # (line1, line2)
+        self._deferred_cost: str | None = None
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
@@ -262,6 +282,13 @@ class StreamingUIHooks:
             "model": data.get("model"),
             "duration_ms": data.get("duration_ms"),
         }
+        # Defensively discard any stale deferred state from the previous turn.
+        # In normal operation content_block:end (final text) → orchestrator:complete
+        # → cleanup:render_end flushes the stash before the next llm:response fires.
+        # This guard protects against edge cases (e.g. aborted turns) where
+        # render_end was never emitted.
+        self._deferred_usage = None
+        self._deferred_cost = None
         return HookResult(action="continue")
 
     def _parse_agent_from_session_id(self, session_id: str | None) -> str | None:
@@ -420,11 +447,7 @@ class StreamingUIHooks:
         #
         # v3: no streaming suppression here. The overlay no longer paints
         # Markdown for text blocks, so there is no double-render risk.
-        if (
-            block_type == "text"
-            and not is_last_block
-            and block.get("text", "").strip()
-        ):
+        if block_type == "text" and not is_last_block and block.get("text", "").strip():
             text = block["text"]
             indent = "    " if agent_name else ""
 
@@ -529,14 +552,54 @@ class StreamingUIHooks:
                 except Exception:
                     cost_part = " | Cost: ?"
 
-            print()  # blank line separates Token Usage from preceding content
-            print(f"{indent}\033[2m│  {header}\033[0m")
-            print(
-                f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
-            )
-            # Clear for next request to avoid stale data
+            # Clear last_llm_info now — the info is already embedded in `header`.
             self.last_llm_info = None
 
+            line1 = f"{indent}\033[2m│  {header}\033[0m"
+            line2 = f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
+
+            if self.overlay_active and block_type == "text":
+                # Defer to cleanup:render_end (fires after render_message paints
+                # the response).  This prevents usage from inserting above the
+                # response — it will appear below it instead.
+                self._deferred_usage = (line1, line2)
+            else:
+                # Inline print: overlay inactive, or last block is not a text
+                # response (e.g. tool_use → render_message won't follow, so
+                # there's no render_end to flush the stash).
+                print()  # blank line separates Token Usage from preceding content
+                print(line1)
+                print(line2)
+
+        return HookResult(action="continue")
+
+    async def handle_render_end(self, _event: str, _data: dict[str, Any]) -> HookResult:
+        """Flush deferred Token Usage + cost line after the response has rendered.
+
+        app-cli emits cleanup:render_end immediately after render_message paints
+        the final response.  By printing here, Token Usage and the turn cost line
+        appear BELOW the response rather than inserting above it.
+
+        Only registered when overlay_active=True (see mount()).  On the non-overlay
+        path this handler is never registered so the stashes stay None.
+
+        Resulting terminal order:
+            Amplifier:
+            [full markdown response]   ← painted by render_message
+                                       ← blank line (this method)
+            │  📊 Token Usage ...      ← flushed here
+            └─ Input: ... | Output: ...
+            💰 Turn: ... | Session: ... ← flushed here
+        """
+        if self._deferred_usage is not None or self._deferred_cost is not None:
+            print()  # blank line between response and usage/cost
+            if self._deferred_usage is not None:
+                print(self._deferred_usage[0])
+                print(self._deferred_usage[1])
+                self._deferred_usage = None
+            if self._deferred_cost is not None:
+                print(self._deferred_cost, flush=True)
+                self._deferred_cost = None
         return HookResult(action="continue")
 
     async def handle_tool_pre(self, _event: str, data: dict[str, Any]) -> HookResult:
@@ -880,7 +943,6 @@ def _sum_cost_usd(contributions: list) -> Decimal | None:
     return total
 
 
-
 # =============================================================================
 # Token-level streaming renderer
 # =============================================================================
@@ -951,9 +1013,7 @@ def _sanitize_delta(text: str, pending: str) -> tuple[str, str]:
     if last_esc >= 0:
         tail = full[last_esc:]
         # If tail matches a complete escape, no holding needed.
-        if not (
-            _CSI_RE.match(tail) or _OSC_RE.match(tail) or _FPFS_RE.match(tail)
-        ):
+        if not (_CSI_RE.match(tail) or _OSC_RE.match(tail) or _FPFS_RE.match(tail)):
             # Incomplete escape — hold from \x1b onward.
             new_pending = tail
             full = full[:last_esc]
@@ -970,9 +1030,7 @@ def _sanitize_delta(text: str, pending: str) -> tuple[str, str]:
     cleaned = "".join(
         c
         for c in cleaned
-        if c in ("\n", "\t")
-        or (0x20 <= ord(c) <= 0x7E)
-        or ord(c) > 0x9F
+        if c in ("\n", "\t") or (0x20 <= ord(c) <= 0x7E) or ord(c) > 0x9F
     )
 
     return cleaned, new_pending
@@ -987,6 +1045,7 @@ def _parse_agent(session_id: str | None) -> str | None:
         return None
     parts = session_id.split("_", 1)
     return parts[1] if len(parts) == 2 else None
+
 
 def _tail_buffer(buf: str, max_lines: int) -> str:
     """Return only the last max_lines lines of buf.
@@ -1184,9 +1243,7 @@ def _make_streaming_overlay():
             _close_live(block)
         s["blocks"] = {}
 
-    async def _on_content_block_start(
-        _event: str, data: dict[str, Any]
-    ) -> HookResult:
+    async def _on_content_block_start(_event: str, data: dict[str, Any]) -> HookResult:
         sid = data.get("session_id") or ""
         idx = data.get("block_index")
         btype = data.get("block_type") or "text"
@@ -1272,9 +1329,7 @@ def _make_streaming_overlay():
             }
             s["blocks"][idx] = block
 
-        clean, block["escape_pending"] = _sanitize_delta(
-            text, block["escape_pending"]
-        )
+        clean, block["escape_pending"] = _sanitize_delta(text, block["escape_pending"])
         if not clean:
             return HookResult(action="continue")
 
@@ -1348,9 +1403,7 @@ def _make_streaming_overlay():
                     pass
         return HookResult(action="continue")
 
-    async def _on_content_block_end(
-        _event: str, data: dict[str, Any]
-    ) -> HookResult:
+    async def _on_content_block_end(_event: str, data: dict[str, Any]) -> HookResult:
         sid = data.get("session_id") or ""
         idx = data.get("block_index")
         if idx is None:
@@ -1406,16 +1459,12 @@ def _make_streaming_overlay():
                     pass
         return HookResult(action="continue")
 
-    async def _on_llm_stream_aborted(
-        _event: str, data: dict[str, Any]
-    ) -> HookResult:
+    async def _on_llm_stream_aborted(_event: str, data: dict[str, Any]) -> HookResult:
         sid = data.get("session_id") or ""
         s = state.get(sid)
         if s is None:
             return HookResult(action="continue")
-        any_painted = any(
-            block.get("buffer") for block in s["blocks"].values()
-        )
+        any_painted = any(block.get("buffer") for block in s["blocks"].values())
         for block in s["blocks"].values():
             _close_live(block)
         if any_painted:
@@ -1427,16 +1476,12 @@ def _make_streaming_overlay():
         s["blocks"] = {}
         return HookResult(action="continue")
 
-    async def _on_provider_retry(
-        _event: str, data: dict[str, Any]
-    ) -> HookResult:
+    async def _on_provider_retry(_event: str, data: dict[str, Any]) -> HookResult:
         sid = data.get("session_id") or ""
         s = state.get(sid)
         if s is None:
             return HookResult(action="continue")
-        any_painted = any(
-            block.get("buffer") for block in s["blocks"].values()
-        )
+        any_painted = any(block.get("buffer") for block in s["blocks"].values())
         for block in s["blocks"].values():
             _close_live(block)
         if any_painted:
@@ -1450,9 +1495,7 @@ def _make_streaming_overlay():
         s["blocks"] = {}
         return HookResult(action="continue")
 
-    async def _on_prompt_submit(
-        _event: str, data: dict[str, Any]
-    ) -> HookResult:
+    async def _on_prompt_submit(_event: str, data: dict[str, Any]) -> HookResult:
         sid = data.get("session_id") or ""
         _reset_session(sid)
         return HookResult(action="continue")
@@ -1468,12 +1511,19 @@ def _make_streaming_overlay():
     }
 
 
-
-def _make_cost_handler(coordinator):
+def _make_cost_handler(coordinator, hooks=None):
     """Create the orchestrator:complete handler and its state.
 
     Returns (handler_coroutine, state_dict) so tests can inspect state.
     The state dict has key 'prev_total'.
+
+    Args:
+        coordinator: Amplifier coordinator for collect_contributions.
+        hooks: Optional StreamingUIHooks instance.  When provided and
+            hooks.overlay_active is True, the cost line is stashed on
+            hooks._deferred_cost instead of printed inline.  It is then
+            flushed by hooks.handle_render_end on cleanup:render_end
+            (emitted by app-cli after render_message).
     """
     state: dict[str, Decimal | None] = {"prev_total": None}
 
@@ -1511,7 +1561,14 @@ def _make_cost_handler(coordinator):
             turn_str = "?"
             session_str = "?"
 
-        print(f"\033[2m💰 Turn: {turn_str} | Session: {session_str}\033[0m", flush=True)
+        cost_line = f"\033[2m💰 Turn: {turn_str} | Session: {session_str}\033[0m"
+
+        if hooks is not None and hooks.overlay_active:
+            # Defer to cleanup:render_end so the cost line appears after
+            # render_message paints the final response (not before it).
+            hooks._deferred_cost = cost_line
+        else:
+            print(cost_line, flush=True)
 
         return HookResult(action="continue")
 
