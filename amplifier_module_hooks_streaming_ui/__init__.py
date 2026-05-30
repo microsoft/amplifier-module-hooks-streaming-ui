@@ -16,11 +16,55 @@ from decimal import Decimal
 from typing import Any
 
 from amplifier_core.models import HookResult
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
-from rich.markdown import Markdown
+from rich.markdown import Heading as _RichHeading
+from rich.markdown import Markdown as _RichMarkdown
+from rich.padding import Padding
+from rich.styled import Styled
+from rich.text import Text
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Left-aligned Markdown ────────────────────────────────────────────────────
+# Rich's default Markdown centers headings.  We always want left-aligned.
+# Pattern mirrors amplifier-app-cli/amplifier_app_cli/console.py — defined
+# locally so this module stays free of any app-layer dependency.
+
+
+class _LeftAlignedHeading(_RichHeading):
+    """Heading with left alignment — overrides Rich's default 'center'."""
+
+    def __rich_console__(self, console: Console, options: Any) -> Any:  # type: ignore[override]
+        text = self.text
+        text.justify = "left"
+        if self.tag == "h1":
+            yield Text("")
+            text.stylize("italic underline")
+            yield text
+            yield Text("")
+        elif self.tag == "h2":
+            yield Text("")
+            text.stylize("bold")
+            yield text
+        else:
+            text.stylize("dim")
+            yield text
+
+
+class Markdown(_RichMarkdown):
+    """Markdown with left-aligned headings.
+
+    Drop-in replacement for rich.markdown.Markdown used throughout this module
+    so headings never centre-align, whether in the streaming Live preview, the
+    final thinking render, or intermediate text blocks.
+    """
+
+    elements = {
+        **_RichMarkdown.elements,
+        "heading_open": _LeftAlignedHeading,
+    }
 
 
 async def mount(coordinator: Any, config: dict[str, Any]) -> None:
@@ -322,38 +366,24 @@ class StreamingUIHooks:
             )
 
             if thinking_text:
-                # Display formatted thinking block with agent context
-                if agent_name:
-                    # Sub-agent thinking: dark gray, 4-space indent, markdown wrapped in dim ANSI codes
-                    print(f"\n    \033[90m{'=' * 56}\033[0m")
-                    print(f"    \033[90m[{agent_name}] Thinking:\033[0m")
-                    print(f"    \033[90m{'-' * 56}\033[0m")
-                    # Render markdown and wrap each line in dim ANSI code with indent
-                    from io import StringIO
-
-                    buffer = StringIO()
-                    temp_console = Console(file=buffer, highlight=False, width=52)
-                    temp_console.print(Markdown(thinking_text))
-                    rendered = buffer.getvalue()
-                    for line in rendered.rstrip().split("\n"):
-                        # Wrap each line in dim ANSI code (same approach as tool results)
-                        print(f"    \033[2m{line}\033[0m")
-                    print(f"    \033[90m{'=' * 56}\033[0m\n")
-                else:
-                    # Parent thinking: markdown rendered and wrapped in dim ANSI codes
-                    from io import StringIO
-
-                    buffer = StringIO()
-                    temp_console = Console(file=buffer, highlight=False, width=60)
-                    temp_console.print(Markdown(thinking_text))
-                    rendered = buffer.getvalue()
-
-                    print(f"\n\033[90m{'=' * 60}\033[0m")
-                    print("\033[90mThinking:\033[0m")
-                    print(f"\033[90m{'-' * 60}\033[0m")
-                    # Wrap markdown in dim ANSI code (same approach as tool results)
-                    print(f"\033[2m{rendered.rstrip()}\033[0m")
-                    print(f"\033[90m{'=' * 60}\033[0m\n")
+                # Use the shared _thinking_renderable for both parent and
+                # sub-agent: full-width, dim+framed, left-aligned headings —
+                # identical to what the streaming Live preview shows, so the
+                # final-snap transition is not jarring.
+                out_console = Console(file=sys.stdout, highlight=False)
+                try:
+                    render_width = out_console.size.width
+                except Exception:
+                    render_width = 80
+                print()  # blank line before the block
+                out_console.print(
+                    _thinking_renderable(
+                        thinking_text,
+                        width=render_width,
+                        agent_name=agent_name,
+                    )
+                )
+                print()  # blank line after the block
 
             # Clean up tracking
             del self.thinking_blocks[block_index]
@@ -952,6 +982,48 @@ def _tail_buffer(buf: str, max_lines: int) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _thinking_renderable(
+    content: str,
+    *,
+    width: int,
+    agent_name: str | None = None,
+) -> Any:
+    """Return a Rich renderable for a thinking block.
+
+    Renders as: dark-gray === / header / --- / dim markdown content / ===
+    at the given width with left-aligned headings.  Suitable for both
+    ``Live.update()`` during streaming and ``console.print()`` for the final
+    atomic render, so both paths produce identical output.
+
+    Args:
+        content: Thinking block text (may be partial during streaming).
+        width: Console width to use for the frame lines.
+        agent_name: When set, adds 4-space indent and a ``[agent] Thinking:``
+            header label; the content is also left-padded by 4 spaces.
+
+    Returns:
+        A Rich renderable (``Group``) suitable for ``Live.update()`` or
+        ``console.print()``.
+    """
+    indent = "    " if agent_name else ""
+    # Subtract indent width so the frame line doesn't overflow the terminal
+    frame_width = max(10, width - (4 if agent_name else 0))
+    header_label = f"[{agent_name}] Thinking:" if agent_name else "Thinking:"
+
+    md = Markdown(content)
+    dim_md: Any = Styled(md, "dim")
+    if agent_name:
+        # Indent the content block to align with the indented frame lines
+        dim_md = Padding(dim_md, (0, 0, 0, 4))
+
+    return Group(
+        Text(indent + "=" * frame_width, style="bright_black"),
+        Text(indent + header_label, style="bright_black"),
+        Text(indent + "-" * frame_width, style="bright_black"),
+        dim_md,
+        Text(indent + "=" * frame_width, style="bright_black"),
+    )
+
 
 def _make_streaming_overlay():
     """v3 Transient Streaming Overlay.
@@ -1061,8 +1133,18 @@ def _make_streaming_overlay():
                 # renderable bounded to terminal height, the clear is
                 # always correct (no overflow into scrollback).
                 try:
+                    if btype == "thinking":
+                        # Start with framed renderable so even the first
+                        # frame shows "Thinking:" + dark-gray border.
+                        try:
+                            w = parent_console.size.width
+                        except Exception:
+                            w = 80
+                        initial: Any = _thinking_renderable("", width=w)
+                    else:
+                        initial = Markdown("")
                     live = Live(
-                        Markdown(""),
+                        initial,
                         console=parent_console,
                         transient=True,
                         refresh_per_second=10,
@@ -1112,17 +1194,32 @@ def _make_streaming_overlay():
         agent = s["agent"]
 
         if agent is None:
-            # Parent: update Live with progressive Markdown.
-            # Cap to terminal height minus a small reserve so Live's
-            # rendered area never exceeds visible rows. With transient=True,
-            # Rich's restore_cursor() uses render-height arithmetic to clear;
-            # the tail-buffer cap keeps the renderable bounded so the clear
-            # is always accurate (no overflow into scrollback).
+            # Parent: update Live with progressive renderable.
+            # Thinking blocks get the shared framed+dim renderable so the
+            # streaming preview and the final atomic render look identical.
+            # Text blocks get plain left-aligned Markdown (no frame).
+            # Cap to terminal height minus a reserve so Live's
+            # restore_cursor() arithmetic is always accurate.
             live = block.get("live")
             if live is not None:
                 try:
-                    max_lines = max(5, parent_console.size.height - 5)
-                    live.update(Markdown(_tail_buffer(block["buffer"], max_lines)))
+                    btype = block.get("type", "text")
+                    if btype == "thinking":
+                        # Reserve 4 extra lines for the 4 frame lines
+                        # (===, header, ---, ===) so the Live region stays
+                        # within the terminal height including the frame.
+                        try:
+                            console_height = parent_console.size.height
+                            console_width = parent_console.size.width
+                        except Exception:
+                            console_height = 24
+                            console_width = 80
+                        max_lines = max(5, console_height - 5 - 4)
+                        tail = _tail_buffer(block["buffer"], max_lines)
+                        live.update(_thinking_renderable(tail, width=console_width))
+                    else:
+                        max_lines = max(5, parent_console.size.height - 5)
+                        live.update(Markdown(_tail_buffer(block["buffer"], max_lines)))
                 except Exception:
                     pass
             else:
