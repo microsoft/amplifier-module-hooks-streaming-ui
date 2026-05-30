@@ -81,8 +81,17 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_token_usage = ui_config.get("show_token_usage", True)
     stream_tokens = ui_config.get("stream_tokens", False)
 
+    # Determine overlay state up front so the atomic renderer can skip
+    # thinking re-paints that the overlay already owns.
+    _is_tty = (
+        sys.stdout.isatty()
+        if hasattr(sys.stdout, "isatty")
+        else False
+    )
+    overlay_active = _is_tty and stream_tokens
+
     # Create hook handlers
-    hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage)
+    hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage, overlay_active=overlay_active)
 
     # Register atomic handlers (existing — unchanged in v2)
     coordinator.hooks.register(
@@ -123,17 +132,14 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     #
     #   - Parent flavor: Rich Live(Markdown(buffer), transient=True). Live opens
     #     on llm:stream_block_start, updates on deltas, closes on
-    #     llm:stream_block_end. Atomic renderer handles final display via
-    #     content_block:end from loop-streaming.
+    #     llm:stream_block_end. For thinking blocks the overlay paints the
+    #     permanent framed block immediately at block-end; the atomic renderer
+    #     skips the re-paint (overlay_active flag). For text/response blocks
+    #     the atomic renderer (and main.py) still own the final display.
     #   - Sub-agent flavor: per-session line buffer. Each delta accumulates;
     #     on newline, the complete line flushes atomically to stderr with
     #     cyan [agent] dim styling. Multiple parallel sub-agents produce
     #     non-interleaved prefixed lines. Atomic renderer paints bordered block.
-    _is_tty = (
-        sys.stdout.isatty()
-        if hasattr(sys.stdout, "isatty")
-        else False
-    )
     if _is_tty and stream_tokens:
         # --- v3 Transient overlay handlers -----------------------------------
         # Subscribes to llm:stream_* events (provider streaming lifecycle),
@@ -191,6 +197,7 @@ class StreamingUIHooks:
         show_thinking: bool,
         show_tool_lines: int,
         show_token_usage: bool,
+        overlay_active: bool = False,
     ):
         """Initialize streaming UI hooks.
 
@@ -198,10 +205,15 @@ class StreamingUIHooks:
             show_thinking: Whether to display thinking blocks
             show_tool_lines: Number of lines to show for tool I/O
             show_token_usage: Whether to display token usage
+            overlay_active: Whether the v3 transient streaming overlay is active.
+                When True, the atomic renderer skips parent thinking re-paints
+                because the overlay already painted them permanently at block-end.
+                When False (default), the atomic renderer paints them as before.
         """
         self.show_thinking = show_thinking
         self.show_tool_lines = show_tool_lines
         self.show_token_usage = show_token_usage
+        self.overlay_active = overlay_active
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
 
@@ -358,34 +370,42 @@ class StreamingUIHooks:
             and block_index is not None
             and block_index in self.thinking_blocks
         ):
-            # Extract thinking text from block
-            thinking_text = (
-                block.get("thinking", "")
-                or block.get("text", "")
-                or _flatten_reasoning_block(block)
-            )
+            # CHANGE B: When the overlay is active it already painted the
+            # thinking block permanently at llm:stream_block_end (CHANGE A).
+            # Skip the re-paint here to avoid a duplicate framed block.
+            # The skip applies only to parent sessions (agent_name is None);
+            # sub-agent thinking is still painted by the atomic renderer.
+            overlay_owns_thinking = self.overlay_active and (agent_name is None)
 
-            if thinking_text:
-                # Use the shared _thinking_renderable for both parent and
-                # sub-agent: full-width, dim+framed, left-aligned headings —
-                # identical to what the streaming Live preview shows, so the
-                # final-snap transition is not jarring.
-                out_console = Console(file=sys.stdout, highlight=False)
-                try:
-                    render_width = out_console.size.width
-                except Exception:
-                    render_width = 80
-                print()  # blank line before the block
-                out_console.print(
-                    _thinking_renderable(
-                        thinking_text,
-                        width=render_width,
-                        agent_name=agent_name,
-                    )
+            if not overlay_owns_thinking:
+                # Extract thinking text from block
+                thinking_text = (
+                    block.get("thinking", "")
+                    or block.get("text", "")
+                    or _flatten_reasoning_block(block)
                 )
-                print()  # blank line after the block
 
-            # Clean up tracking
+                if thinking_text:
+                    # Use the shared _thinking_renderable for both parent and
+                    # sub-agent: full-width, dim+framed, left-aligned headings —
+                    # identical to what the streaming Live preview shows, so the
+                    # final-snap transition is not jarring.
+                    out_console = Console(file=sys.stdout, highlight=False)
+                    try:
+                        render_width = out_console.size.width
+                    except Exception:
+                        render_width = 80
+                    print()  # blank line before the block
+                    out_console.print(
+                        _thinking_renderable(
+                            thinking_text,
+                            width=render_width,
+                            agent_name=agent_name,
+                        )
+                    )
+                    print()  # blank line after the block
+
+            # Always clean up tracking (whether painted or skipped)
             del self.thinking_blocks[block_index]
 
         # Display intermediate text blocks (P2 fix)
@@ -1258,19 +1278,37 @@ def _make_streaming_overlay():
             return HookResult(action="continue")
 
         agent = s["agent"]
+        btype = block.get("type", "")
         buffer = block["buffer"]
 
         if agent is None:
-            # Parent: close Live (clears the transient region).
-            # v3: no inline Markdown paint here. The atomic renderer
-            # (handle_content_block_end on StreamingUIHooks, triggered by
-            # loop-streaming's content_block:end synthesis) handles final
-            # display. The overlay's job is only to manage the Live region.
+            # Parent: close Live first (clears the transient capped preview).
             _close_live(block)
-            # Thinking blocks: no inline paint. Atomic handler paints the
-            # formatted bordered Thinking block via content_block:end.
+
+            # CHANGE A: For parent thinking blocks, immediately paint the
+            # permanent framed version after the transient is cleared. This
+            # resolves the thinking block in place so it stays on screen
+            # while the response streams below it. The full accumulated
+            # buffer is used (not tail-capped) so the complete thinking
+            # scrolls naturally. The atomic renderer (handle_content_block_end
+            # on StreamingUIHooks) sees overlay_active=True and skips the
+            # re-paint, avoiding a duplicate framed block.
+            #
+            # Text/response blocks: no inline paint here — the atomic renderer
+            # and main.py still own those final displays.
             # Tool_use blocks: no Live was opened; nothing to close. The
             # tool:pre/tool:post flow handles the formatted box.
+            if btype == "thinking" and buffer.strip():
+                try:
+                    try:
+                        w = parent_console.size.width
+                    except Exception:
+                        w = 80
+                    parent_console.print(
+                        _thinking_renderable(buffer, width=w, agent_name=None)
+                    )
+                except Exception:
+                    pass
         else:
             # Sub-agent: flush any trailing partial line.
             tail = buffer
