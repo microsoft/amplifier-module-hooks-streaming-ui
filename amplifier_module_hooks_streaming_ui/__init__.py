@@ -931,6 +931,26 @@ def _parse_agent(session_id: str | None) -> str | None:
     parts = session_id.split("_", 1)
     return parts[1] if len(parts) == 2 else None
 
+def _tail_buffer(buf: str, max_lines: int) -> str:
+    """Return only the last max_lines lines of buf.
+
+    Used to keep the Rich Live region bounded by terminal height. When the
+    streaming buffer's rendered height exceeds the terminal's visible rows,
+    overflow content scrolls off Live's visible area and survives
+    Live.stop()(transient=True) cleanup as ghost text in scrollback. Capping
+    what Live sees to (terminal_height - reserve) prevents the overflow.
+
+    The internal buffer keeps growing for correctness; only the slice shown
+    to Live is trimmed.
+    """
+    if max_lines <= 0:
+        return buf
+    lines = buf.split("\n")
+    if len(lines) <= max_lines:
+        return buf
+    return "\n".join(lines[-max_lines:])
+
+
 def _make_streaming_overlay():
     """v3 Transient Streaming Overlay.
 
@@ -1087,10 +1107,15 @@ def _make_streaming_overlay():
 
         if agent is None:
             # Parent: update Live with progressive Markdown.
+            # Cap to terminal height minus a small reserve so Live's
+            # rendered area never exceeds visible rows. transient=True
+            # can only clean what's currently visible — overflow scrolls
+            # into scrollback and survives Live.stop() as ghost text.
             live = block.get("live")
             if live is not None:
                 try:
-                    live.update(Markdown(block["buffer"]))
+                    max_lines = max(5, parent_console.size.height - 5)
+                    live.update(Markdown(_tail_buffer(block["buffer"], max_lines)))
                 except Exception:
                     pass
             else:
