@@ -35,6 +35,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_thinking = ui_config.get("show_thinking_stream", True)
     show_tool_lines = ui_config.get("show_tool_lines", 5)
     show_token_usage = ui_config.get("show_token_usage", True)
+    stream_tokens = ui_config.get("stream_tokens", False)
 
     # Create hook handlers
     hooks = StreamingUIHooks(show_thinking, show_tool_lines, show_token_usage)
@@ -89,7 +90,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         if hasattr(sys.stdout, "isatty")
         else False
     )
-    if _is_tty:
+    if _is_tty and stream_tokens:
         # --- v3 Transient overlay handlers -----------------------------------
         # Subscribes to llm:stream_* events (provider streaming lifecycle),
         # NOT content_block:* events (synthesized by loop-streaming).
@@ -133,7 +134,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         )
 
     # Log successful mount
-    logger.info("Mounted hooks-streaming-ui (tty=%s) [v3]", _is_tty)
+    logger.info("Mounted hooks-streaming-ui (tty=%s, stream_tokens=%s) [v3]", _is_tty, stream_tokens)
 
     return
 
