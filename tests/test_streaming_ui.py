@@ -1,7 +1,8 @@
 """Tests for streaming UI hooks module."""
 
+import io
 import re
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from amplifier_core import HookResult
@@ -821,4 +822,91 @@ class TestTokenUsageCostDisplay:
         captured = capsys.readouterr()
         assert "Cost:" not in captured.out, (
             f"Cost: should not appear when cost_usd is None, got: {captured.out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for the streaming overlay label behaviour (feat/label-in-stream)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingOverlayLabel:
+    """The v3 transient overlay prints 'Amplifier:' permanently before Live starts
+    for text blocks, and suppresses it for thinking and sub-agent blocks."""
+
+    @pytest.mark.asyncio
+    async def test_label_printed_for_parent_text_block(self):
+        """Overlay prints 'Amplifier:' to a permanent line when a parent text block starts."""
+        import amplifier_module_hooks_streaming_ui as _mod
+
+        buf = io.StringIO()
+        with patch.object(_mod, "Live") as mock_live_cls, patch("sys.stdout", buf):
+            mock_live_cls.return_value = MagicMock()
+            overlay = _mod._make_streaming_overlay()
+            handler = overlay["llm:stream_block_start"]
+
+            result = await handler(
+                "llm:stream_block_start",
+                {
+                    "session_id": "sess-parent",  # no underscore -> agent is None
+                    "block_index": 0,
+                    "block_type": "text",
+                },
+            )
+
+        assert isinstance(result, HookResult)
+        assert result.action == "continue"
+        assert "Amplifier:" in buf.getvalue(), (
+            f"Expected 'Amplifier:' in stdout for text block; got: {buf.getvalue()!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_label_not_printed_for_thinking_block(self):
+        """Overlay does NOT print 'Amplifier:' for thinking blocks (they have their own header)."""
+        import amplifier_module_hooks_streaming_ui as _mod
+
+        buf = io.StringIO()
+        with patch.object(_mod, "Live") as mock_live_cls, patch("sys.stdout", buf):
+            mock_live_cls.return_value = MagicMock()
+            overlay = _mod._make_streaming_overlay()
+            handler = overlay["llm:stream_block_start"]
+
+            result = await handler(
+                "llm:stream_block_start",
+                {
+                    "session_id": "sess-parent",
+                    "block_index": 0,
+                    "block_type": "thinking",
+                },
+            )
+
+        assert result.action == "continue"
+        assert "Amplifier:" not in buf.getvalue(), (
+            f"'Amplifier:' should not appear for thinking block; got: {buf.getvalue()!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_label_not_printed_for_sub_agent_text_block(self):
+        """Overlay does NOT print 'Amplifier:' for sub-agent sessions (they use stderr)."""
+        import amplifier_module_hooks_streaming_ui as _mod
+
+        buf = io.StringIO()
+        with patch.object(_mod, "Live") as mock_live_cls, patch("sys.stdout", buf):
+            mock_live_cls.return_value = MagicMock()
+            overlay = _mod._make_streaming_overlay()
+            handler = overlay["llm:stream_block_start"]
+
+            # Sub-agent session IDs contain an underscore after the span portion.
+            result = await handler(
+                "llm:stream_block_start",
+                {
+                    "session_id": "parent-span_explorer",  # underscore -> agent='explorer'
+                    "block_index": 0,
+                    "block_type": "text",
+                },
+            )
+
+        assert result.action == "continue"
+        assert "Amplifier:" not in buf.getvalue(), (
+            f"'Amplifier:' should not appear for sub-agent block; got: {buf.getvalue()!r}"
         )
