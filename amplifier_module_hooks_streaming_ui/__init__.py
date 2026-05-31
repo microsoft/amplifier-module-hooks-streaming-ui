@@ -166,11 +166,6 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
             name="streaming-ui-overlay-delta",
         )
         coordinator.hooks.register(
-            "llm:stream_thinking_delta",
-            _overlay["llm:stream_thinking_delta"],
-            name="streaming-ui-overlay-thinking-delta",
-        )
-        coordinator.hooks.register(
             "llm:stream_block_end",
             _overlay["llm:stream_block_end"],
             name="streaming-ui-overlay-end",
@@ -1304,10 +1299,11 @@ def _make_streaming_overlay():
         # is initialized as part of the block dict above.
         return HookResult(action="continue")
 
-    async def _on_delta(event: str, data: dict[str, Any]) -> HookResult:
-        """Shared handler for llm:stream_block_delta AND llm:stream_thinking_delta.
-        The block_type was recorded at llm:stream_block_start; both delta event
-        types just append text to the relevant block's buffer."""
+    async def _on_delta(_event: str, data: dict[str, Any]) -> HookResult:
+        """Handler for llm:stream_block_delta (all block types — text and thinking).
+        block_type is read from the payload; if absent, falls back to the type
+        recorded at llm:stream_block_start. Consumers route on block_type, not
+        on event name."""
         text = data.get("text") or ""
         if not text:
             return HookResult(action="continue")
@@ -1319,9 +1315,10 @@ def _make_streaming_overlay():
         block = s["blocks"].get(idx)
         if block is None:
             # Delta without a matching start (shouldn't happen but defensive).
-            # Synthesize a minimal block entry.
+            # Synthesize a minimal block entry; block_type comes from the
+            # payload (present on every delta per the contract).
             block = {
-                "type": "thinking" if event == "llm:stream_thinking_delta" else "text",
+                "type": data.get("block_type", "text"),
                 "buffer": "",
                 "live": None,
                 "escape_pending": "",
@@ -1503,7 +1500,6 @@ def _make_streaming_overlay():
     return {
         "llm:stream_block_start": _on_content_block_start,
         "llm:stream_block_delta": _on_delta,
-        "llm:stream_thinking_delta": _on_delta,
         "llm:stream_block_end": _on_content_block_end,
         "llm:stream_aborted": _on_llm_stream_aborted,
         "provider:retry": _on_provider_retry,
