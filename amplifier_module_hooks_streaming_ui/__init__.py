@@ -1272,6 +1272,19 @@ def _make_streaming_overlay():
                 # height arithmetic. With _tail_buffer() keeping the Live
                 # renderable bounded to terminal height, the clear is
                 # always correct (no overflow into scrollback).
+
+                # Print the assistant label permanently, above the transient
+                # Live region, so it survives the overlay clear and appears as
+                # part of the streamed response.  Thinking blocks have their
+                # own framed header; tool_use blocks are not handled here.
+                # (When the overlay is active, app-cli suppresses its own
+                # post-stream label so it prints exactly once.)
+                if btype == "text":
+                    try:
+                        parent_console.print("\n[bold green]Amplifier:[/bold green]")
+                    except Exception:
+                        pass
+
                 try:
                     if btype == "thinking":
                         # Start with framed renderable so even the first
