@@ -1,8 +1,7 @@
 """Unit tests for _paint_interleaved_text and the overlay look-ahead state machine.
 
 Covers:
-  - Short text (<3 wrapped lines) → whisper ▸ + ANSI-256 colors 110/188
-  - Long text (≥3 wrapped lines) → rail ▍ on every line + ANSI-256 colors 103/145
+  - ALL text lengths → rail ▍ on every line (no whisper ▸, ever)
   - Sub-agent path uses wrap_width=52 and 4-space indent
   - Overlay look-ahead state machine: pending_text stashed at block_end(text),
     drained+painted at block_start(tool_use), and index recorded in
@@ -11,11 +10,10 @@ Covers:
 
 from __future__ import annotations
 
-import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-import pytest
 import amplifier_module_hooks_streaming_ui as _mod
+import pytest
 from amplifier_module_hooks_streaming_ui import StreamingUIHooks
 
 
@@ -38,21 +36,21 @@ def _hooks(**overrides) -> StreamingUIHooks:
 class TestPaintInterleavedText:
     """Unit tests for the extracted _paint_interleaved_text helper."""
 
-    def test_short_text_emits_whisper_glyph(self, capsys):
-        """Short text (<3 rendered lines) should print the whisper ▸ glyph."""
+    def test_short_text_emits_rail_glyph(self, capsys):
+        """Short text (<3 rendered lines) must now use the rail ▍ glyph, not ▸."""
         hooks = _hooks()
         hooks._paint_interleaved_text("Let me check that.", None)
         out = capsys.readouterr().out
-        assert "\u25b8" in out, f"Expected whisper glyph ▸ in output; got: {out!r}"
-        assert "\u258d" not in out, "Rail glyph ▍ should not appear for short text"
+        assert "▍" in out, f"Expected rail glyph ▍ in output; got: {out!r}"
+        assert "▸" not in out, "Whisper glyph ▸ must NEVER appear (whisper removed)"
 
-    def test_short_text_uses_ansi_256_colors_110_and_188(self, capsys):
-        """Whisper path must use ANSI-256 color 110 for glyph and 188 for text."""
+    def test_short_text_never_uses_whisper(self, capsys):
+        """Short text must NOT produce ▸ (whisper removed entirely)."""
         hooks = _hooks()
         hooks._paint_interleaved_text("Short.", None)
         out = capsys.readouterr().out
-        assert "\033[38;5;110m" in out, "Expected ANSI-256 color 110 (soft blue glyph)"
-        assert "\033[38;5;188m" in out, "Expected ANSI-256 color 188 (muted warm white text)"
+        assert "▸" not in out, "Whisper glyph ▸ should never appear after unification"
+        assert "▍" in out, "Rail glyph ▍ must appear for short text"
 
     def test_long_text_emits_rail_glyph_on_every_line(self, capsys):
         """Long text (≥3 rendered lines) should print the rail ▍ on every non-blank line."""
@@ -61,34 +59,28 @@ class TestPaintInterleavedText:
         text = "Line one analysis.\n\nLine two continues.\n\nLine three concludes."
         hooks._paint_interleaved_text(text, None)
         out = capsys.readouterr().out
-        assert "\u258d" in out, f"Expected rail glyph ▍ in output; got: {out!r}"
-        assert "\u25b8" not in out, "Whisper glyph ▸ should not appear for long text"
-
-    def test_long_text_uses_ansi_256_colors_103_and_145(self, capsys):
-        """Rail path must use ANSI-256 color 103 for rail and 145 for text."""
-        hooks = _hooks()
-        text = "Para one.\n\nPara two.\n\nPara three."
-        hooks._paint_interleaved_text(text, None)
-        out = capsys.readouterr().out
-        assert "\033[38;5;103m" in out, "Expected ANSI-256 color 103 (muted lavender rail)"
-        assert "\033[38;5;145m" in out, "Expected ANSI-256 color 145 (warm gray text)"
+        assert "▍" in out, f"Expected rail glyph ▍ in output; got: {out!r}"
+        assert "▸" not in out, "Whisper glyph ▸ should not appear for long text"
 
     def test_sub_agent_uses_4_space_indent(self, capsys):
         """Sub-agent path (agent_name set) should indent with 4 spaces."""
         hooks = _hooks()
         hooks._paint_interleaved_text("Checking structure.", "foundation:explorer")
         out = capsys.readouterr().out
-        # The 4-space indent must appear somewhere in the output
-        assert "    " in out, f"Expected 4-space indent for sub-agent; got: {out!r}"
+        # The 4-space indent must appear on lines with ▍
+        glyph_lines = [ln for ln in out.split("\n") if "▍" in ln]
+        assert glyph_lines, "No ▍ lines found in sub-agent output"
+        assert any("    " in ln for ln in glyph_lines), (
+            f"Expected 4-space indent for sub-agent; got: {out!r}"
+        )
         assert "Checking structure." in out
 
     def test_sub_agent_uses_wrap_width_52(self, capsys):
         """Sub-agent path wraps at width 52; parent wraps at 60.
 
         A line of 56 characters should wrap for sub-agent (52) but not for
-        parent (60).  We verify that sub-agent output has more lines by
-        checking that rail mode triggers at a text that stays whisper-mode
-        for the parent.
+        parent (60).  We verify that sub-agent output has the ▍ glyph and
+        both contain the text content.
         """
         hooks = _hooks()
         # 56 characters — wraps at 52 (sub-agent) but fits at 60 (parent)
@@ -111,8 +103,8 @@ class TestPaintInterleavedText:
         hooks._paint_interleaved_text("Simple text.", None)
         out = capsys.readouterr().out
         lines = out.split("\n")
-        # Content lines should not start with 4 spaces
-        content_lines = [l for l in lines if "\u25b8" in l or "\u258d" in l]
+        # Content lines (those with the rail glyph) should not start with 4 spaces
+        content_lines = [line for line in lines if "▍" in line]
         for line in content_lines:
             assert not line.startswith("    "), (
                 f"Parent line should not start with 4-space indent: {line!r}"
@@ -160,11 +152,21 @@ class TestOverlayLookAheadStateMachine:
             # 2. a few deltas arrive
             await delta_h(
                 "llm:stream_block_delta",
-                {"session_id": sid, "block_index": 0, "block_type": "text", "text": "Let me "},
+                {
+                    "session_id": sid,
+                    "block_index": 0,
+                    "block_type": "text",
+                    "text": "Let me ",
+                },
             )
             await delta_h(
                 "llm:stream_block_delta",
-                {"session_id": sid, "block_index": 0, "block_type": "text", "text": "think."},
+                {
+                    "session_id": sid,
+                    "block_index": 0,
+                    "block_type": "text",
+                    "text": "think.",
+                },
             )
 
             # Painter must NOT have been called yet
@@ -237,7 +239,12 @@ class TestOverlayLookAheadStateMachine:
             )
             await delta_h(
                 "llm:stream_block_delta",
-                {"session_id": sid, "block_index": 0, "block_type": "text", "text": "Final answer."},
+                {
+                    "session_id": sid,
+                    "block_index": 0,
+                    "block_type": "text",
+                    "text": "Final answer.",
+                },
             )
             await end_h(
                 "llm:stream_block_end",
@@ -277,7 +284,12 @@ class TestOverlayLookAheadStateMachine:
             )
             await delta_h(
                 "llm:stream_block_delta",
-                {"session_id": sid, "block_index": 0, "block_type": "text", "text": "Hello."},
+                {
+                    "session_id": sid,
+                    "block_index": 0,
+                    "block_type": "text",
+                    "text": "Hello.",
+                },
             )
             await end_h(
                 "llm:stream_block_end",
@@ -294,6 +306,6 @@ class TestOverlayLookAheadStateMachine:
             )
 
         # Painter must never have been called (stash was cleared before new block)
-        paint_mock.assert_not_called(), (
+        assert paint_mock.call_count == 0, (
             f"Painter should not be called after reset; got {paint_mock.call_count} calls"
         )

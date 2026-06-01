@@ -1,9 +1,8 @@
 """Tests for intermediate text block rendering in streaming UI hooks.
 
 Covers:
-- Short text (< 3 lines) renders with whisper prefix (▸)
-- Long text (>= 3 lines) renders with narration rail (▍)
-- Correct ANSI 256-color codes for each mode
+- All text lengths (short AND long) render with rail prefix (▍) — no whisper (▸) ever
+- Correct ANSI 256-color codes for rail mode
 - Empty text blocks are skipped
 - Last-block exclusion (final response not rendered as intermediate)
 - Sub-agent text uses correct indentation
@@ -44,13 +43,13 @@ def _text_block_end_event(text, block_index=0, total_blocks=2, session_id=None):
 
 
 # ---------------------------------------------------------------------------
-# Short text: whisper prefix (▸)
+# Short text: rail (▍) — whisper removed
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_short_text_renders_whisper_prefix(capsys):
-    """Text under 3 lines should render with ▸ prefix."""
+async def test_short_text_renders_rail_glyph(capsys):
+    """Short text (< 3 lines) must now render with ▍ rail glyph, not ▸ whisper."""
     hooks = _hooks()
     data = _text_block_end_event("Let me check that config.")
 
@@ -61,14 +60,15 @@ async def test_short_text_renders_whisper_prefix(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    # The whisper prefix glyph must appear
-    assert "\u25b8" in output
+    # Rail glyph must appear — whisper is removed
+    assert "▍" in output, f"Expected ▍ in output; got: {output!r}"
+    assert "▸" not in output, "Whisper glyph ▸ must never appear after unification"
     assert "Let me check that config." in output
 
 
 @pytest.mark.asyncio
-async def test_two_line_text_uses_whisper(capsys):
-    """Two-line text should still use whisper prefix, not rail."""
+async def test_two_line_text_uses_rail(capsys):
+    """Two-line text must use rail ▍, not whisper ▸."""
     hooks = _hooks()
     data = _text_block_end_event("Line one.\nLine two.")
 
@@ -76,13 +76,13 @@ async def test_two_line_text_uses_whisper(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    assert "\u25b8" in output
-    # Rail character should NOT appear for short text
-    assert "\u258d" not in output
+    assert "▍" in output, f"Expected ▍ in output; got: {output!r}"
+    # Whisper character must NOT appear
+    assert "▸" not in output, "Whisper glyph ▸ must never appear"
 
 
 # ---------------------------------------------------------------------------
-# Long text: narration rail (▍)
+# Long text: rail (▍) — unchanged
 # ---------------------------------------------------------------------------
 
 
@@ -103,12 +103,12 @@ async def test_long_text_renders_narration_rail(capsys):
     captured = capsys.readouterr()
     output = captured.out
     # Rail character must appear (>= 3 rendered lines triggers rail mode)
-    assert "\u258d" in output
+    assert "▍" in output
     assert "Line one of analysis." in output
     assert "Line two continues." in output
     assert "Line three concludes." in output
-    # Whisper prefix should NOT appear for long text
-    assert "\u25b8" not in output
+    # Whisper prefix should NOT appear
+    assert "▸" not in output
 
 
 @pytest.mark.asyncio
@@ -124,46 +124,8 @@ async def test_five_line_text_uses_rail(capsys):
     captured = capsys.readouterr()
     output = captured.out
     # Rail glyph must appear (>= 3 rendered lines)
-    assert "\u258d" in output
-    assert "\u25b8" not in output
-
-
-# ---------------------------------------------------------------------------
-# ANSI color codes
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_whisper_uses_correct_ansi_colors(capsys):
-    """Whisper prefix should use ANSI 256-color 110 (soft blue) for glyph
-    and 256-color 188 (muted warm white) for text."""
-    hooks = _hooks()
-    data = _text_block_end_event("Short text.")
-
-    await hooks.handle_content_block_end("content_block:end", data)
-
-    captured = capsys.readouterr()
-    output = captured.out
-    # ANSI 256-color escape: \033[38;5;Nm
-    assert "\033[38;5;110m" in output  # Soft blue for glyph
-    assert "\033[38;5;188m" in output  # Muted warm white for text
-
-
-@pytest.mark.asyncio
-async def test_rail_uses_correct_ansi_colors(capsys):
-    """Rail should use ANSI 256-color 103 (muted lavender) for rail
-    and 256-color 145 (warm gray) for text."""
-    hooks = _hooks()
-    # Double newlines create separate Markdown paragraphs -> 3+ rendered lines
-    text = "Line one.\n\nLine two.\n\nLine three."
-    data = _text_block_end_event(text)
-
-    await hooks.handle_content_block_end("content_block:end", data)
-
-    captured = capsys.readouterr()
-    output = captured.out
-    assert "\033[38;5;103m" in output  # Muted lavender for rail
-    assert "\033[38;5;145m" in output  # Warm gray for text
+    assert "▍" in output
+    assert "▸" not in output
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +145,8 @@ async def test_empty_text_block_skipped(capsys):
     captured = capsys.readouterr()
     output = captured.out
     # No whisper or rail characters should appear
-    assert "\u25b8" not in output
-    assert "\u258d" not in output
+    assert "▸" not in output
+    assert "▍" not in output
 
 
 @pytest.mark.asyncio
@@ -203,8 +165,8 @@ async def test_last_block_text_not_rendered_as_intermediate(capsys):
     captured = capsys.readouterr()
     output = captured.out
     # Should NOT render with whisper or rail
-    assert "\u25b8" not in output
-    assert "\u258d" not in output
+    assert "▸" not in output
+    assert "▍" not in output
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +202,9 @@ async def test_sub_agent_text_indented(capsys):
 async def test_long_single_line_wraps_to_rail_mode(capsys):
     """A single raw line that wraps to 3+ rendered lines should use rail mode.
 
-    The line count threshold (< 3 vs >= 3) must be based on the RENDERED output
-    lines (after Rich Markdown wrapping), not the raw input lines. A single long
-    line that wraps to many lines should trigger rail mode (▍), not whisper (▸).
+    The line count threshold must be based on the RENDERED output lines (after
+    Rich Markdown wrapping), not the raw input lines. A single long line that
+    wraps to many lines should trigger rail mode (▍), not whisper (▸).
     """
     hooks = _hooks()
     # A single line long enough to wrap well past 3 lines at width=60

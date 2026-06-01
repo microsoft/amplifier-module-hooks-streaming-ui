@@ -367,17 +367,14 @@ class StreamingUIHooks:
         return HookResult(action="continue")
 
     def _paint_interleaved_text(self, text: str, agent_name: str | None) -> None:
-        """Paint an interleaved text block using whisper or rail style.
+        """Paint an interleaved text block using rail style.
 
         Called both by handle_content_block_end (deferred path) and by the
         overlay's _on_content_block_start look-ahead (in-place path).  Extracted
         from the original inline block so both callers share identical output.
 
-        Short text (< 3 rendered lines): whisper style — ▸ prefix, ANSI-256
-        colors 110 (glyph) and 188 (text).
-
-        Long text (≥ 3 rendered lines): rail style — ▍ on every line, ANSI-256
-        colors 103 (rail) and 145 (text).
+        All text (any length) uses rail style — ▍ on every line, ANSI-256
+        colors 103 (rail) and 145 (text), via the shared ``_rail_renderable``.
 
         Sub-agent (agent_name is not None): wrap_width=52, 4-space indent.
         Parent (agent_name is None): wrap_width=60, no indent.
@@ -387,36 +384,10 @@ class StreamingUIHooks:
                         callers are responsible for the strip() guard.
             agent_name: Agent name for sub-agent indentation, or None for parent.
         """
-        from io import StringIO
-
-        indent = "    " if agent_name else ""
-        wrap_width = 52 if agent_name else 60
-        buffer = StringIO()
-        temp_console = Console(file=buffer, highlight=False, width=wrap_width)
-        temp_console.print(Markdown(text))
-        rendered = buffer.getvalue()
-        lines = rendered.rstrip().split("\n")
-        line_count = len(lines)
-
-        # ANSI 256-color escape sequences
-        RESET = "\033[0m"
-
-        if line_count < 3:
-            # Whisper mode: ▸ prefix on first line, 2-space indent on continuation
-            GLYPH_COLOR = "\033[38;5;110m"  # Soft blue for ▸
-            TEXT_COLOR = "\033[38;5;188m"  # Muted warm white for text
-            print(f"\n{indent}{GLYPH_COLOR}\u25b8{RESET} {TEXT_COLOR}{lines[0]}{RESET}")
-            for line in lines[1:]:
-                print(f"{indent}  {TEXT_COLOR}{line}{RESET}")
-            print()  # Blank line after
-        else:
-            # Rail mode: ▍ on every line
-            RAIL_COLOR = "\033[38;5;103m"  # Muted lavender for ▍
-            TEXT_COLOR = "\033[38;5;145m"  # Warm gray for text
-            print()  # Blank line before
-            for line in lines:
-                print(f"{indent}{RAIL_COLOR}\u258d{RESET} {TEXT_COLOR}{line}{RESET}")
-            print()  # Blank line after
+        print()  # Blank line before
+        out_console = Console(file=sys.stdout, highlight=False)
+        out_console.print(_rail_renderable(text, agent_name))
+        print()  # Blank line after
 
     async def handle_content_block_end(
         self, _event: str, data: dict[str, Any]
@@ -1202,15 +1173,58 @@ def _thinking_renderable(
     )
 
 
+def _rail_renderable(content: str, agent_name: str | None = None) -> Any:
+    """Return a Rich renderable for a rail-style interleaved aside.
+
+    Renders as: one Rich ``Text`` row per rendered line, each prefixed with
+    ``▍`` in ``color(103)`` and the line text in ``color(145)``.  Suitable
+    for both ``_paint_interleaved_text`` (settled output) and
+    ``_text_renderable`` (streaming preview), so both paths produce identical
+    rail output — just as ``_thinking_renderable`` is shared between the
+    thinking-block Live preview and the final atomic render.
+
+    Args:
+        content:    The aside text (Markdown).  Empty / whitespace-only
+                    content returns an empty ``Group`` with no output.
+        agent_name: When set, adds a 4-space indent before the ``▍`` glyph
+                    and wraps at width 52; parent (``None``) uses width 60
+                    with no indent.
+
+    Returns:
+        A Rich renderable (``Group``) suitable for ``Live.update()`` or
+        ``console.print()``.
+    """
+    from io import StringIO
+
+    if not content.strip():
+        return Group()
+
+    indent = "    " if agent_name else ""
+    wrap_width = 52 if agent_name else 60
+
+    buf = StringIO()
+    Console(file=buf, highlight=False, width=wrap_width).print(Markdown(content))
+    lines = buf.getvalue().rstrip("\n").split("\n")
+
+    rows = []
+    for line in lines:
+        row = Text(indent)
+        row.append("▍ ", style="color(103)")
+        row.append(line, style="color(145)")
+        rows.append(row)
+
+    return Group(*rows)
+
+
 def _text_renderable(content: str) -> Any:
     """Return a Rich renderable for a streaming parent *text* block.
 
     Renders as: a blank separator line, a bold-green ``Amplifier:`` label,
-    then the markdown body. The label lives INSIDE the transient Live region
-    (it is NOT printed permanently), so it clears together with the streamed
-    text when the block ends:
+    then the rail aside body (``▍`` on every line).  The label lives INSIDE
+    the transient Live region (it is NOT printed permanently), so it clears
+    together with the streamed text when the block ends:
 
-      - interleaved asides clear and finalize to the muted whisper/rail note
+      - interleaved asides clear and finalize to the muted rail note
         (no label) -- the label was only a transient "assistant is speaking"
         marker during the aside's stream.
       - the final response clears and is re-rendered by app-cli's
@@ -1219,12 +1233,14 @@ def _text_renderable(content: str) -> Any:
 
     Used for both ``Live.update()`` during streaming and the height
     measurement in :func:`_fit_tail_to_height`, so the budget arithmetic
-    accounts for the two leading lines (blank + label).
+    accounts for the two leading lines (blank + label).  The rail body adds
+    ``▍`` glyph width to each line, which ``_fit_tail_to_height`` measures
+    accurately via ``console.render_lines`` — no budget change needed.
     """
     return Group(
         Text(""),
         Text("Amplifier:", style="bold green"),
-        Markdown(content),
+        _rail_renderable(content),
     )
 
 
