@@ -1,8 +1,9 @@
 """Unit tests for _paint_interleaved_text and the overlay look-ahead state machine.
 
 Covers:
-  - ALL text lengths → rail ▍ on every line (no whisper ▸, ever)
-  - Sub-agent path uses wrap_width=52 and 4-space indent
+  - Parent (agent_name=None): Amplifier: label + full-width Markdown body (no ▍ glyph)
+    — the uniform renderable identical to the streaming preview
+  - Sub-agent path still uses ▍ rail with wrap_width=52 and 4-space indent (unchanged)
   - Overlay look-ahead state machine: pending_text stashed at block_end(text),
     drained+painted at block_start(tool_use), and index recorded in
     hooks._overlay_painted_text so handle_content_block_end skips it
@@ -36,13 +37,24 @@ def _hooks(**overrides) -> StreamingUIHooks:
 class TestPaintInterleavedText:
     """Unit tests for the extracted _paint_interleaved_text helper."""
 
-    def test_short_text_emits_rail_glyph(self, capsys):
-        """Short text (<3 rendered lines) must now use the rail ▍ glyph, not ▸."""
+    def test_parent_emits_amplifier_label(self, capsys):
+        """Parent path (agent_name=None) must emit 'Amplifier:' label — uniform renderable."""
         hooks = _hooks()
         hooks._paint_interleaved_text("Let me check that.", None)
         out = capsys.readouterr().out
-        assert "▍" in out, f"Expected rail glyph ▍ in output; got: {out!r}"
-        assert "▸" not in out, "Whisper glyph ▸ must NEVER appear (whisper removed)"
+        assert "Amplifier:" in out, (
+            f"Parent _paint_interleaved_text must contain 'Amplifier:'; got: {out!r}"
+        )
+        assert "Let me check that." in out
+
+    def test_parent_no_rail_glyph(self, capsys):
+        """Parent path must NOT use ▍ rail glyph — uses full-width Markdown."""
+        hooks = _hooks()
+        hooks._paint_interleaved_text("Let me check that.", None)
+        out = capsys.readouterr().out
+        assert "▍" not in out, (
+            f"Parent _paint_interleaved_text must not use ▍; got: {out!r}"
+        )
 
     def test_short_text_never_uses_whisper(self, capsys):
         """Short text must NOT produce ▸ (whisper removed entirely)."""
@@ -50,17 +62,17 @@ class TestPaintInterleavedText:
         hooks._paint_interleaved_text("Short.", None)
         out = capsys.readouterr().out
         assert "▸" not in out, "Whisper glyph ▸ should never appear after unification"
-        assert "▍" in out, "Rail glyph ▍ must appear for short text"
 
-    def test_long_text_emits_rail_glyph_on_every_line(self, capsys):
-        """Long text (≥3 rendered lines) should print the rail ▍ on every non-blank line."""
+    def test_long_text_no_rail_glyph_on_parent(self, capsys):
+        """Long text in parent path must NOT use ▍ — parent always uses Markdown body."""
         hooks = _hooks()
         # Double newlines create separate Markdown paragraphs → ≥3 rendered lines
         text = "Line one analysis.\n\nLine two continues.\n\nLine three concludes."
         hooks._paint_interleaved_text(text, None)
         out = capsys.readouterr().out
-        assert "▍" in out, f"Expected rail glyph ▍ in output; got: {out!r}"
-        assert "▸" not in out, "Whisper glyph ▸ should not appear for long text"
+        assert "▍" not in out, f"Parent must never use ▍ (uses Markdown); got: {out!r}"
+        assert "▸" not in out, "Whisper glyph ▸ should not appear"
+        assert "Amplifier:" in out
 
     def test_sub_agent_uses_4_space_indent(self, capsys):
         """Sub-agent path (agent_name set) should indent with 4 spaces."""
@@ -76,10 +88,10 @@ class TestPaintInterleavedText:
         assert "Checking structure." in out
 
     def test_sub_agent_uses_wrap_width_52(self, capsys):
-        """Sub-agent path wraps at width 52; parent wraps at 60.
+        """Sub-agent path wraps at width 52; parent wraps at full console width.
 
-        A line of 56 characters should wrap for sub-agent (52) but not for
-        parent (60).  We verify that sub-agent output has the ▍ glyph and
+        A line of 56 characters should wrap for sub-agent (52) but fits in parent
+        full-width.  We verify that sub-agent output has the ▍ glyph and
         both contain the text content.
         """
         hooks = _hooks()
@@ -91,23 +103,27 @@ class TestPaintInterleavedText:
         hooks._paint_interleaved_text(text, "some-agent")
         subagent_out = capsys.readouterr().out
 
-        # Sub-agent output should be indented
+        # Sub-agent output should be indented with ▍
+        assert "▍" in subagent_out, "Sub-agent must use ▍"
         assert "    " in subagent_out
         # Both should contain the text content
         assert "A" * 10 in parent_out
         assert "A" * 10 in subagent_out
 
-    def test_parent_has_no_indent(self, capsys):
-        """Parent path (agent_name=None) must not add a 4-space indent prefix."""
+    def test_parent_has_no_4_space_indent(self, capsys):
+        """Parent path (agent_name=None) must not add a 4-space indent prefix.
+
+        Parent uses _text_renderable → Amplifier: label + Markdown body.
+        The Amplifier: label and Markdown content should not be indented.
+        """
         hooks = _hooks()
         hooks._paint_interleaved_text("Simple text.", None)
         out = capsys.readouterr().out
-        lines = out.split("\n")
-        # Content lines (those with the rail glyph) should not start with 4 spaces
-        content_lines = [line for line in lines if "▍" in line]
-        for line in content_lines:
+        # 'Amplifier:' line must not start with 4 spaces
+        amp_lines = [line for line in out.split("\n") if "Amplifier:" in line]
+        for line in amp_lines:
             assert not line.startswith("    "), (
-                f"Parent line should not start with 4-space indent: {line!r}"
+                f"Parent 'Amplifier:' line should not start with 4-space indent: {line!r}"
             )
 
 
@@ -217,7 +233,8 @@ class TestOverlayLookAheadStateMachine:
         The stash cleanup happens at reset time (_on_prompt_submit); between
         block_end(text) and the reset the stash is simply held.
         The final-response text is rendered via handle_content_block_end's
-        is_last_block → render_message path, NOT by the overlay painter.
+        text-block paint path (the hook now owns the final paint, not
+        render_message — the is_last_block guard was removed).
         """
         hooks = _hooks()
         paint_mock = MagicMock()
@@ -251,7 +268,8 @@ class TestOverlayLookAheadStateMachine:
                 {"session_id": sid, "block_index": 0},
             )
 
-            # No block_start follows — painter must NOT have been called
+            # No block_start follows — overlay painter must NOT have been called
+            # (handle_content_block_end is the sole painter for the final block)
             paint_mock.assert_not_called()
 
         # overlay_painted_text should NOT have this sid (no paint recorded)

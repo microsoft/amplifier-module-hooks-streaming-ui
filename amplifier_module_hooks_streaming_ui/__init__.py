@@ -367,27 +367,41 @@ class StreamingUIHooks:
         return HookResult(action="continue")
 
     def _paint_interleaved_text(self, text: str, agent_name: str | None) -> None:
-        """Paint an interleaved text block using rail style.
+        """Paint an interleaved text block using the appropriate renderable.
 
-        Called both by handle_content_block_end (deferred path) and by the
+        Called both by handle_content_block_end (deferred/final path) and by the
         overlay's _on_content_block_start look-ahead (in-place path).  Extracted
         from the original inline block so both callers share identical output.
 
-        All text (any length) uses rail style — ▍ on every line, ANSI-256
-        colors 103 (rail) and 145 (text), via the shared ``_rail_renderable``.
+        Parent (agent_name is None): renders via ``_text_renderable`` — the same
+        ``Amplifier:`` label + full-width ``Markdown`` body used by the streaming
+        Live preview.  This makes the streaming preview and the settled paint
+        byte-identical (no snap).  ``_text_renderable`` includes a leading blank
+        line (``Text("")``); do NOT add a second leading blank.  One trailing
+        blank line is added for separation.
 
-        Sub-agent (agent_name is not None): wrap_width=52, 4-space indent.
-        Parent (agent_name is None): wrap_width=60, no indent.
+        Sub-agent (agent_name is not None): unchanged rail rendering via
+        ``_rail_renderable`` — ``▍`` on every line, ANSI-256 colors 103/145,
+        wrap_width=52, 4-space indent.
 
         Args:
             text:       The interleaved text to render.  Must be non-empty;
                         callers are responsible for the strip() guard.
             agent_name: Agent name for sub-agent indentation, or None for parent.
         """
-        print()  # Blank line before
-        out_console = Console(file=sys.stdout, highlight=False)
-        out_console.print(_rail_renderable(text, agent_name))
-        print()  # Blank line after
+        if agent_name is None:
+            # Parent: uniform renderable identical to the streaming Live preview.
+            # _text_renderable already includes a leading blank line (Text(""));
+            # do NOT add a second one.  Add ONE trailing blank for separation.
+            out = Console(file=sys.stdout, highlight=False)
+            out.print(_text_renderable(text))
+            print()
+        else:
+            # Sub-agent: unchanged rail rendering.
+            print()  # Blank line before
+            out_console = Console(file=sys.stdout, highlight=False)
+            out_console.print(_rail_renderable(text, agent_name))
+            print()  # Blank line after
 
     async def handle_content_block_end(
         self, _event: str, data: dict[str, Any]
@@ -463,17 +477,24 @@ class StreamingUIHooks:
             # Always clean up tracking (whether painted or skipped)
             del self.thinking_blocks[block_index]
 
-        # Display intermediate text blocks (P2 fix)
-        # Only render text that accompanies tool calls (not the final response).
-        # The final response (last block when stop_reason=end_turn) is rendered
-        # by the main response path at full brightness.
+        # Paint parent text blocks — both interleaved asides AND the final response.
         #
-        # v3 + look-ahead fix: when the overlay is active, it paints interleaved
-        # text IN PLACE at the start of the NEXT block (look-ahead).  The index
-        # is recorded in self._overlay_painted_text so the deferred path here can
-        # skip the duplicate.  Sub-agent path (agent_name is not None) is
-        # unaffected — it always renders here.
-        if block_type == "text" and not is_last_block and block.get("text", "").strip():
+        # The hook now owns the final-response render (is_last_block guard removed).
+        # The overlay's look-ahead stash (pending_text) handles INTERLEAVED asides:
+        # it paints them IN PLACE at the start of the NEXT block, records the index
+        # in self._overlay_painted_text, and the guard below suppresses the duplicate
+        # here.  The FINAL text block has no following block — it is never stashed
+        # by the look-ahead — so it falls through to _paint_interleaved_text and
+        # gets painted here via the uniform _text_renderable (Amplifier: + Markdown).
+        #
+        # When the overlay is active, app-cli's render_message is suppressed for the
+        # turn (the overlay flag tells the app layer not to re-render), so the hook
+        # is the sole painter of the final response.  Token Usage and turn-cost are
+        # still deferred to cleanup:render_end so they land below the response.
+        #
+        # Sub-agent path (agent_name is not None) is unaffected — it always renders
+        # here via _rail_renderable (unchanged).
+        if block_type == "text" and block.get("text", "").strip():
             text = block["text"]
             # Guard: skip if the overlay already painted this block in-place.
             # Only applies to parent sessions (agent_name is None); sub-agent
@@ -560,8 +581,9 @@ class StreamingUIHooks:
             line2 = f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
 
             if self.overlay_active and block_type == "text":
-                # Defer to cleanup:render_end (fires after render_message paints
-                # the response).  This prevents usage from inserting above the
+                # Defer to cleanup:render_end (fires after the hook paints the
+                # response in handle_content_block_end, then app-cli emits
+                # render_end).  This prevents usage from inserting above the
                 # response — it will appear below it instead.
                 self._deferred_usage = (line1, line2)
             else:
@@ -1220,27 +1242,35 @@ def _text_renderable(content: str) -> Any:
     """Return a Rich renderable for a streaming parent *text* block.
 
     Renders as: a blank separator line, a bold-green ``Amplifier:`` label,
-    then the rail aside body (``▍`` on every line).  The label lives INSIDE
-    the transient Live region (it is NOT printed permanently), so it clears
-    together with the streamed text when the block ends:
+    then full-width ``Markdown(content)`` as the body.  This is the **single
+    uniform renderable** used for:
 
-      - interleaved asides clear and finalize to the muted rail note
-        (no label) -- the label was only a transient "assistant is speaking"
-        marker during the aside's stream.
-      - the final response clears and is re-rendered by app-cli's
-        render_message, which prints its own ``Amplifier:`` + markdown -- so
-        the label persists ONLY for the final response.
+      - streaming preview: ``Live.update(_text_renderable(tail))`` during
+        token streaming (transient — clears when block ends).
+      - settled interleaved asides: ``_paint_interleaved_text`` for parent
+        sessions, which calls ``Console.print(_text_renderable(text))``.
+      - final response: ``handle_content_block_end`` now paints the final
+        text block via ``_paint_interleaved_text`` as well.
+
+    Because the streaming preview, settled asides, and final response all
+    use this same renderable, there is NO snap at settle time — the output
+    is byte-identical.
+
+    The label lives INSIDE the transient Live region (it is NOT printed
+    permanently during streaming), so it clears together with the streamed
+    text when the block ends.  On settle / final paint it is printed once
+    via ``console.print``.
 
     Used for both ``Live.update()`` during streaming and the height
     measurement in :func:`_fit_tail_to_height`, so the budget arithmetic
-    accounts for the two leading lines (blank + label).  The rail body adds
-    ``▍`` glyph width to each line, which ``_fit_tail_to_height`` measures
+    accounts for the two leading lines (blank + label).  The ``Markdown``
+    body uses the full console width, which ``_fit_tail_to_height`` measures
     accurately via ``console.render_lines`` — no budget change needed.
     """
     return Group(
         Text(""),
         Text("Amplifier:", style="bold green"),
-        _rail_renderable(content),
+        Markdown(content),
     )
 
 
@@ -1560,10 +1590,13 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
             # the index so handle_content_block_end skips the duplicate.
             #
             # If there IS no next block (final response / end-of-turn), the
-            # stash is cleaned up by _reset_session (called from
-            # _on_prompt_submit / _on_llm_stream_aborted / _on_provider_retry)
-            # and handle_content_block_end renders it via the existing
-            # is_last_block → render_message path unchanged.
+            # stash is held here and cleaned up later:
+            #   - handle_content_block_end is the SOLE painter of the final
+            #     text block: it falls through to _paint_interleaved_text
+            #     (not in _overlay_painted_text → not skipped) and renders
+            #     via the uniform _text_renderable (Amplifier: + Markdown).
+            #   - _reset_session (from _on_prompt_submit / _on_llm_stream_aborted
+            #     / _on_provider_retry) clears any leftover stash without painting.
             if btype == "text" and buffer.strip():
                 s["pending_text"] = {
                     "index": idx,

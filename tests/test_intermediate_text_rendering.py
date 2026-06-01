@@ -1,11 +1,11 @@
 """Tests for intermediate text block rendering in streaming UI hooks.
 
 Covers:
-- All text lengths (short AND long) render with rail prefix (▍) — no whisper (▸) ever
-- Correct ANSI 256-color codes for rail mode
+- All text lengths (short AND long) render via _text_renderable (Amplifier: + Markdown,
+  no ▍ rail glyph) — the uniform parent-text renderable
 - Empty text blocks are skipped
-- Last-block exclusion (final response not rendered as intermediate)
-- Sub-agent text uses correct indentation
+- Final-block inclusion: hook now paints the FINAL response via _text_renderable
+- Sub-agent text still uses ▍ rail indentation (unchanged)
 - Spacing: blank line before and after text blocks
 """
 
@@ -43,13 +43,13 @@ def _text_block_end_event(text, block_index=0, total_blocks=2, session_id=None):
 
 
 # ---------------------------------------------------------------------------
-# Short text: rail (▍) — whisper removed
+# Short text: uniform Amplifier: + Markdown (no ▍)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_short_text_renders_rail_glyph(capsys):
-    """Short text (< 3 lines) must now render with ▍ rail glyph, not ▸ whisper."""
+async def test_short_text_renders_amplifier_label(capsys):
+    """Short intermediate text must render with 'Amplifier:' label, no ▍ glyph."""
     hooks = _hooks()
     data = _text_block_end_event("Let me check that config.")
 
@@ -60,15 +60,16 @@ async def test_short_text_renders_rail_glyph(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    # Rail glyph must appear — whisper is removed
-    assert "▍" in output, f"Expected ▍ in output; got: {output!r}"
-    assert "▸" not in output, "Whisper glyph ▸ must never appear after unification"
+    # Uniform renderable: Amplifier: label + Markdown body, no rail glyph
+    assert "Amplifier:" in output, f"Expected 'Amplifier:' in output; got: {output!r}"
+    assert "▍" not in output, "Rail glyph ▍ must NOT appear — parent uses Markdown body"
+    assert "▸" not in output, "Whisper glyph ▸ must never appear"
     assert "Let me check that config." in output
 
 
 @pytest.mark.asyncio
-async def test_two_line_text_uses_rail(capsys):
-    """Two-line text must use rail ▍, not whisper ▸."""
+async def test_two_line_text_renders_amplifier_label(capsys):
+    """Two-line intermediate text must use Amplifier: + Markdown, not ▍."""
     hooks = _hooks()
     data = _text_block_end_event("Line one.\nLine two.")
 
@@ -76,25 +77,20 @@ async def test_two_line_text_uses_rail(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    assert "▍" in output, f"Expected ▍ in output; got: {output!r}"
-    # Whisper character must NOT appear
+    assert "Amplifier:" in output, f"Expected 'Amplifier:' in output; got: {output!r}"
+    assert "▍" not in output, "Rail glyph ▍ must NOT appear in parent output"
     assert "▸" not in output, "Whisper glyph ▸ must never appear"
 
 
 # ---------------------------------------------------------------------------
-# Long text: rail (▍) — unchanged
+# Long text: uniform Amplifier: + Markdown (no ▍)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_long_text_renders_narration_rail(capsys):
-    """Text of 3+ rendered lines should render with ▍ rail on every line.
-
-    Uses Markdown paragraphs (double newline) so Rich renders each as a
-    separate block, producing 3+ output lines and triggering rail mode.
-    """
+async def test_long_text_renders_amplifier_label(capsys):
+    """Multi-paragraph intermediate text renders via Amplifier: + Markdown."""
     hooks = _hooks()
-    # Double newlines create separate Markdown paragraphs -> separate rendered lines
     text = "Line one of analysis.\n\nLine two continues.\n\nLine three concludes."
     data = _text_block_end_event(text)
 
@@ -102,20 +98,18 @@ async def test_long_text_renders_narration_rail(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    # Rail character must appear (>= 3 rendered lines triggers rail mode)
-    assert "▍" in output
+    assert "Amplifier:" in output
+    assert "▍" not in output, "No ▍ glyph for parent — uses full-width Markdown"
     assert "Line one of analysis." in output
     assert "Line two continues." in output
     assert "Line three concludes." in output
-    # Whisper prefix should NOT appear
     assert "▸" not in output
 
 
 @pytest.mark.asyncio
-async def test_five_line_text_uses_rail(capsys):
-    """Five paragraphs should use the rail (>= 3 rendered lines)."""
+async def test_five_line_text_renders_amplifier_label(capsys):
+    """Five paragraphs should render via Amplifier: + Markdown (not rail)."""
     hooks = _hooks()
-    # Double newlines create separate Markdown paragraphs
     text = "\n\n".join(f"Analysis line {i + 1}." for i in range(5))
     data = _text_block_end_event(text)
 
@@ -123,8 +117,38 @@ async def test_five_line_text_uses_rail(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    # Rail glyph must appear (>= 3 rendered lines)
-    assert "▍" in output
+    assert "Amplifier:" in output
+    assert "▍" not in output
+    assert "▸" not in output
+
+
+# ---------------------------------------------------------------------------
+# Final block: hook now PAINTS the final response
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_final_block_IS_painted_by_hook(capsys):
+    """Text that is the LAST block (end_turn) IS now painted by the hook.
+
+    Changed in feat/uniform-assistant-render: handle_content_block_end no longer
+    skips is_last_block text.  The hook owns the final-response paint via
+    _paint_interleaved_text → _text_renderable (Amplifier: + Markdown).
+    """
+    hooks = _hooks()
+    # block_index=0, total_blocks=1 means this is the ONLY block (final response)
+    data = _text_block_end_event("Final answer.", block_index=0, total_blocks=1)
+
+    await hooks.handle_content_block_end("content_block:end", data)
+
+    captured = capsys.readouterr()
+    output = captured.out
+    # Hook must paint the final block with the uniform renderable
+    assert "Final answer." in output, (
+        f"Final text block must be painted by hook; got: {output!r}"
+    )
+    assert "Amplifier:" in output, "Final block must use uniform Amplifier: label"
+    assert "▍" not in output, "Final block must use Markdown body (no ▍)"
     assert "▸" not in output
 
 
@@ -144,33 +168,14 @@ async def test_empty_text_block_skipped(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    # No whisper or rail characters should appear
+    # No output at all for empty blocks
     assert "▸" not in output
     assert "▍" not in output
-
-
-@pytest.mark.asyncio
-async def test_last_block_text_not_rendered_as_intermediate(capsys):
-    """Text that is the LAST block (end_turn) should NOT get intermediate treatment.
-
-    The final response text is rendered by the main response path at full brightness,
-    not by this hook. We only render intermediate text (not the last block).
-    """
-    hooks = _hooks()
-    # block_index=0, total_blocks=1 means this is the ONLY block (final response)
-    data = _text_block_end_event("Final answer.", block_index=0, total_blocks=1)
-
-    await hooks.handle_content_block_end("content_block:end", data)
-
-    captured = capsys.readouterr()
-    output = captured.out
-    # Should NOT render with whisper or rail
-    assert "▸" not in output
-    assert "▍" not in output
+    assert "Amplifier:" not in output
 
 
 # ---------------------------------------------------------------------------
-# Sub-agent indentation
+# Sub-agent indentation (unchanged — still uses ▍ rail)
 # ---------------------------------------------------------------------------
 
 
@@ -194,34 +199,6 @@ async def test_sub_agent_text_indented(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Rich Markdown wrapping
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_long_single_line_wraps_to_rail_mode(capsys):
-    """A single raw line that wraps to 3+ rendered lines should use rail mode.
-
-    The line count threshold must be based on the RENDERED output lines (after
-    Rich Markdown wrapping), not the raw input lines. A single long line that
-    wraps to many lines should trigger rail mode (▍), not whisper (▸).
-    """
-    hooks = _hooks()
-    # A single line long enough to wrap well past 3 lines at width=60
-    long_line = "This is a very long sentence that should definitely wrap around " * 8
-    data = _text_block_end_event(long_line.strip())
-
-    await hooks.handle_content_block_end("content_block:end", data)
-
-    captured = capsys.readouterr()
-    output = captured.out
-    # Should use rail mode because rendered lines >= 3
-    assert "▍" in output, "Expected rail glyph for long wrapped text"
-    # Should NOT use whisper prefix
-    assert "▸" not in output, "Whisper glyph should not appear for long wrapped text"
-
-
-# ---------------------------------------------------------------------------
 # Spacing
 # ---------------------------------------------------------------------------
 
@@ -236,7 +213,27 @@ async def test_blank_line_before_and_after(capsys):
 
     captured = capsys.readouterr()
     output = captured.out
-    # Output should start with a newline (blank line before)
+    # Output should start with a newline (blank line before, from Text("") in _text_renderable)
     assert output.startswith("\n")
     # Output should end with a newline (blank line after)
     assert output.rstrip("\n") != output  # has trailing newline
+
+
+@pytest.mark.asyncio
+async def test_long_single_line_renders_amplifier_label(capsys):
+    """A single raw line that wraps renders via Amplifier: + Markdown, no rail glyph.
+
+    The render uses full terminal width Markdown, not the narrow 60-char rail wrapper.
+    """
+    hooks = _hooks()
+    long_line = "This is a very long sentence that should definitely wrap around " * 8
+    data = _text_block_end_event(long_line.strip())
+
+    await hooks.handle_content_block_end("content_block:end", data)
+
+    captured = capsys.readouterr()
+    output = captured.out
+    # Should use uniform Amplifier: + Markdown — no rail glyph
+    assert "Amplifier:" in output, "Expected 'Amplifier:' for long wrapped text"
+    assert "▍" not in output, "Rail glyph ▍ must not appear — parent uses Markdown"
+    assert "▸" not in output, "Whisper glyph should not appear"
