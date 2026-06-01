@@ -372,6 +372,7 @@ class StreamingUIHooks:
         agent_name: str | None,
         *,
         omit_trailing_blank: bool = False,
+        dim: bool = False,
     ) -> None:
         """Paint an interleaved text block using the appropriate renderable.
 
@@ -400,7 +401,7 @@ class StreamingUIHooks:
             # _text_renderable already includes a leading blank line (Text(""));
             # do NOT add a second one.  Add ONE trailing blank for separation.
             out = Console(file=sys.stdout, highlight=False)
-            out.print(_text_renderable(text))
+            out.print(_text_renderable(text, dim=dim))
             if not omit_trailing_blank:
                 # The final response is immediately followed by the Token Usage
                 # panel, which supplies its OWN leading blank line. Emitting our
@@ -525,8 +526,13 @@ class StreamingUIHooks:
                 will_show_usage = bool(
                     is_last_block and self.show_token_usage and usage
                 )
+                # Settled asides (not the final response) are dimmed so they
+                # recede when scrolling back; the final response stays bright.
                 self._paint_interleaved_text(
-                    text, agent_name, omit_trailing_blank=will_show_usage
+                    text,
+                    agent_name,
+                    omit_trailing_blank=will_show_usage,
+                    dim=not is_last_block,
                 )
 
         # Display token usage after last block (if present and configured)
@@ -1258,7 +1264,7 @@ def _rail_renderable(content: str, agent_name: str | None = None) -> Any:
     return Group(*rows)
 
 
-def _text_renderable(content: str) -> Any:
+def _text_renderable(content: str, *, dim: bool = False) -> Any:
     """Return a Rich renderable for a streaming parent *text* block.
 
     Renders as: a blank separator line, a bold-green ``Amplifier:`` label,
@@ -1287,10 +1293,20 @@ def _text_renderable(content: str) -> Any:
     body uses the full console width, which ``_fit_tail_to_height`` measures
     accurately via ``console.render_lines`` — no budget change needed.
     """
+    body: Any = Markdown(content)
+    if dim:
+        # Settled interleaved asides are dimmed so they don't compete with the
+        # final response when scrolling back. Layout is byte-identical to the
+        # bright version (same label, same full-width Markdown wrap) — only the
+        # styling changes, so the streaming->settled transition is non-jarring
+        # (a dim-down in place, not a reflow). The streaming preview and the
+        # final response stay bright (dim=False); we can't tell aside from final
+        # until the block ends, so the de-emphasis is applied only at settle.
+        body = Styled(body, "dim")
     return Group(
         Text(""),
-        Text("Amplifier:", style="bold green"),
-        Markdown(content),
+        Text("Amplifier:", style="dim green" if dim else "bold green"),
+        body,
     )
 
 
@@ -1391,8 +1407,10 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
         # agent is None paths); sub-agent sessions never set pending_text.
         pending = s.pop("pending_text", None)
         if pending is not None and pending["buffer"].strip():
+            # Look-ahead always drains an INTERLEAVED aside (a next block has
+            # started), so it is always dimmed.
             hooks_instance._paint_interleaved_text(
-                pending["buffer"], pending["agent_name"]
+                pending["buffer"], pending["agent_name"], dim=True
             )
             # Record in hooks-side set so handle_content_block_end skips it
             # (Part 4 guard — suppress the deferred duplicate render).

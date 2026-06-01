@@ -981,3 +981,35 @@ class TestStreamingOverlayLabel:
         assert "Amplifier:" not in buf.getvalue(), (
             f"'Amplifier:' should not appear for sub-agent block; got: {buf.getvalue()!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Settled-aside dimming (dim=True) vs bright final/streaming (dim=False)
+# ---------------------------------------------------------------------------
+
+
+def _render_text_renderable(dim: bool) -> str:
+    import io as _io
+
+    import amplifier_module_hooks_streaming_ui as _mod
+    from rich.console import Console
+
+    buf = _io.StringIO()
+    Console(file=buf, width=80, force_terminal=True, color_system="standard").print(
+        _mod._text_renderable("hello world", dim=dim)
+    )
+    return buf.getvalue()
+
+
+def test_dim_aside_dims_label_and_body():
+    """dim=True emits a dim ANSI sequence (label + body); content/label intact."""
+    out = _render_text_renderable(dim=True)
+    assert "Amplifier:" in out and "hello world" in out
+    assert "\x1b[2m" in out  # dim SGR present
+
+
+def test_bright_final_has_no_dim():
+    """dim=False (final response / streaming preview) emits NO dim SGR."""
+    out = _render_text_renderable(dim=False)
+    assert "Amplifier:" in out and "hello world" in out
+    assert "\x1b[2m" not in out
