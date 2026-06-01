@@ -710,11 +710,17 @@ class StreamingUIHooks:
         result = data.get("tool_response", data.get("result", {}))
         session_id = data.get("session_id")
 
-        # Change 5: when the task tool returns a successful sub-agent response,
-        # suppress the result body — change 4 already rendered the attributed final.
-        # Only suppress if the result dict has a "response" key (success shape).
-        # Error-shaped results (no "response" key, strings, etc.) render as today.
-        if tool_name == "task" and isinstance(result, dict) and "response" in result:
+        # Change 5: when the sub-agent spawn tool returns a successful sub-agent
+        # response, suppress the result body — change 4 already rendered the
+        # attributed final. The spawn tool is named "delegate" in current builds
+        # (and "task" in older ones), so match both. Only suppress if the result
+        # dict has a "response" key (success shape). Error-shaped results (no
+        # "response" key, strings, etc.) render as today so failures aren't hidden.
+        if (
+            tool_name in ("task", "delegate")
+            and isinstance(result, dict)
+            and "response" in result
+        ):
             return HookResult(action="continue")
 
         # Detect if this is a sub-agent's tool result
