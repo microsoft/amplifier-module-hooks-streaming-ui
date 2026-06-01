@@ -349,11 +349,9 @@ class StreamingUIHooks:
         ):
             self.thinking_blocks[block_index] = {"started": True, "agent": agent_name}
             if agent_name:
-                # Sub-agent thinking: status line cyan, 4-space indent
-                sys.stderr.write(
-                    f"\n    \033[36m🤔 [{agent_name}] Thinking...\033[0m\n"
-                )
-                sys.stderr.flush()
+                # Change 2: suppress sub-agent thinking-start status line.
+                # Parent path below is unchanged.
+                pass
             else:
                 # Parent thinking: status line cyan.
                 # Skip when the overlay is active — the overlay already shows a
@@ -410,9 +408,12 @@ class StreamingUIHooks:
                 # placeholder has no leading blank of its own.
                 print()
         else:
-            # Sub-agent: unchanged rail rendering.
+            # Sub-agent final result: attributed header + rail body (change 4).
+            # A dim-cyan [agent_name] header precedes the rail so parallel-agent
+            # readers can tell whose result it is.
             print()  # Blank line before
             out_console = Console(file=sys.stdout, highlight=False)
+            out_console.print(Text(f"[{agent_name}]", style="dim cyan"))
             out_console.print(_rail_renderable(text, agent_name))
             print()  # Blank line after
 
@@ -455,11 +456,12 @@ class StreamingUIHooks:
             # CHANGE B: When the overlay is active it already painted the
             # thinking block permanently at llm:stream_block_end (CHANGE A).
             # Skip the re-paint here to avoid a duplicate framed block.
-            # The skip applies only to parent sessions (agent_name is None);
-            # sub-agent thinking is still painted by the atomic renderer.
+            # The skip applies only to parent sessions (agent_name is None).
             overlay_owns_thinking = self.overlay_active and (agent_name is None)
 
-            if not overlay_owns_thinking:
+            # Change 3: paint thinking only for parent sessions.
+            # Sub-agent thinking is suppressed (no framed block).
+            if not overlay_owns_thinking and agent_name is None:
                 # Extract thinking text from block
                 thinking_text = (
                     block.get("thinking", "")
@@ -490,9 +492,9 @@ class StreamingUIHooks:
             # Always clean up tracking (whether painted or skipped)
             del self.thinking_blocks[block_index]
 
-        # Paint parent text blocks — both interleaved asides AND the final response.
+        # Paint text blocks.
         #
-        # The hook now owns the final-response render (is_last_block guard removed).
+        # PARENT (agent_name is None): owns the final-response render.
         # The overlay's look-ahead stash (pending_text) handles INTERLEAVED asides:
         # it paints them IN PLACE at the start of the NEXT block, records the index
         # in self._overlay_painted_text, and the guard below suppresses the duplicate
@@ -500,40 +502,43 @@ class StreamingUIHooks:
         # by the look-ahead — so it falls through to _paint_interleaved_text and
         # gets painted here via the uniform _text_renderable (Amplifier: + Markdown).
         #
-        # When the overlay is active, app-cli's render_message is suppressed for the
-        # turn (the overlay flag tells the app layer not to re-render), so the hook
-        # is the sole painter of the final response.  Token Usage and turn-cost are
-        # still deferred to cleanup:render_end so they land below the response.
-        #
-        # Sub-agent path (agent_name is not None) is unaffected — it always renders
-        # here via _rail_renderable (unchanged).
+        # SUB-AGENT (agent_name is not None) — Change 4:
+        # Intermediate asides (not is_last_block) are SUPPRESSED.
+        # Final result (is_last_block) is painted ATTRIBUTED via
+        # _paint_interleaved_text, which renders a dim-cyan [agent_name] header
+        # above the _rail_renderable body so the reader can tell whose result it is.
         if block_type == "text" and block.get("text", "").strip():
             text = block["text"]
-            # Guard: skip if the overlay already painted this block in-place.
-            # Only applies to parent sessions (agent_name is None); sub-agent
-            # text always falls through to the painter here.
-            sid_key = session_id or ""
-            painted_set = self._overlay_painted_text.get(sid_key)
-            if painted_set is not None and block_index in painted_set:
-                # Overlay already rendered this block — suppress the duplicate.
-                painted_set.discard(block_index)
-                if not painted_set:
-                    del self._overlay_painted_text[sid_key]
+            if agent_name is None:
+                # Parent path: guard against overlay duplicate; then paint (unchanged).
+                sid_key = session_id or ""
+                painted_set = self._overlay_painted_text.get(sid_key)
+                if painted_set is not None and block_index in painted_set:
+                    # Overlay already rendered this block — suppress the duplicate.
+                    painted_set.discard(block_index)
+                    if not painted_set:
+                        del self._overlay_painted_text[sid_key]
+                else:
+                    # When this is the final response AND the Token Usage panel will
+                    # follow (it brings its own leading blank), omit our trailing
+                    # blank so the two don't stack into a double blank line.
+                    will_show_usage = bool(
+                        is_last_block and self.show_token_usage and usage
+                    )
+                    # Settled asides (not the final response) are dimmed so they
+                    # recede when scrolling back; the final response stays bright.
+                    self._paint_interleaved_text(
+                        text,
+                        agent_name,
+                        omit_trailing_blank=will_show_usage,
+                        dim=not is_last_block,
+                    )
             else:
-                # When this is the final response AND the Token Usage panel will
-                # follow (it brings its own leading blank), omit our trailing
-                # blank so the two don't stack into a double blank line.
-                will_show_usage = bool(
-                    is_last_block and self.show_token_usage and usage
-                )
-                # Settled asides (not the final response) are dimmed so they
-                # recede when scrolling back; the final response stays bright.
-                self._paint_interleaved_text(
-                    text,
-                    agent_name,
-                    omit_trailing_blank=will_show_usage,
-                    dim=not is_last_block,
-                )
+                # Sub-agent (change 4): suppress intermediate asides;
+                # render only the final result, attributed with agent name.
+                if is_last_block:
+                    self._paint_interleaved_text(text, agent_name)
+                # else: intermediate aside — suppressed
 
         # Display token usage after last block (if present and configured)
         if is_last_block and self.show_token_usage and usage:
@@ -704,6 +709,13 @@ class StreamingUIHooks:
         tool_name = data.get("tool_name", "unknown")
         result = data.get("tool_response", data.get("result", {}))
         session_id = data.get("session_id")
+
+        # Change 5: when the task tool returns a successful sub-agent response,
+        # suppress the result body — change 4 already rendered the attributed final.
+        # Only suppress if the result dict has a "response" key (success shape).
+        # Error-shaped results (no "response" key, strings, etc.) render as today.
+        if tool_name == "task" and isinstance(result, dict) and "response" in result:
+            return HookResult(action="continue")
 
         # Detect if this is a sub-agent's tool result
         agent_name = self._parse_agent_from_session_id(session_id)
@@ -1564,18 +1576,11 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                 except BrokenPipeError:
                     pass
         else:
-            # Sub-agent: line-buffered. Flush each complete line as
-            # an atomic write to stderr with [agent] cyan + dim styling.
-            while "\n" in block["buffer"]:
-                line, _, rest = block["buffer"].partition("\n")
-                block["buffer"] = rest
-                try:
-                    sys.stderr.write(
-                        f"    \033[36m[{agent}]\033[0m \033[2m{line}\033[0m\n"
-                    )
-                    sys.stderr.flush()
-                except BrokenPipeError:
-                    pass
+            # Change 1: sub-agent live stream suppressed.
+            # Buffer has already accumulated above (block["buffer"] += clean).
+            # Nothing is written to stderr — all live sub-agent output is held
+            # until content_block:end where the final result is painted attributed.
+            pass
         return HookResult(action="continue")
 
     async def _on_content_block_end(_event: str, data: dict[str, Any]) -> HookResult:
@@ -1642,17 +1647,9 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                     "agent_name": agent,  # None for parent sessions
                 }
         else:
-            # Sub-agent: flush any trailing partial line.
-            tail = buffer
+            # Sub-agent: clear buffer. Trailing flush suppressed (change 1) —
+            # nothing was streamed to stderr, so no orphaned partial to flush.
             block["buffer"] = ""
-            if tail:
-                try:
-                    sys.stderr.write(
-                        f"    \033[36m[{agent}]\033[0m \033[2m{tail}\033[0m\n"
-                    )
-                    sys.stderr.flush()
-                except BrokenPipeError:
-                    pass
         return HookResult(action="continue")
 
     async def _on_llm_stream_aborted(_event: str, data: dict[str, Any]) -> HookResult:
