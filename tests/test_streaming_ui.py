@@ -846,8 +846,13 @@ class TestTextRenderable:
         assert "Amplifier:" in out
         assert "hello world" in out
 
-    def test_body_uses_rail_glyph(self):
-        """_text_renderable body must use the rail ▍ glyph (not plain Markdown)."""
+    def test_body_uses_full_width_markdown(self):
+        """_text_renderable body must use full-width Markdown (no ▍ rail glyph).
+
+        The body is Markdown(content) so the streaming preview and the settled
+        paint (_paint_interleaved_text → _text_renderable) are byte-identical —
+        the whole point of the uniform-render change.
+        """
         import amplifier_module_hooks_streaming_ui as _mod
         from rich.console import Console
 
@@ -856,7 +861,10 @@ class TestTextRenderable:
             _mod._text_renderable("hello world")
         )
         out = b.getvalue()
-        assert "▍" in out, f"Expected ▍ in _text_renderable body; got: {out!r}"
+        assert "▍" not in out, (
+            f"_text_renderable body must NOT use ▍ (now full-width Markdown); got: {out!r}"
+        )
+        assert "hello world" in out, "Content text must be present in rendered output"
         assert "▸" not in out, "Whisper glyph ▸ must never appear in _text_renderable"
 
     def test_empty_content_still_shows_label(self):

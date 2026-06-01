@@ -157,7 +157,9 @@ async def test_mount_registers_orchestrator_complete_handler():
 async def test_orchestrator_complete_degrades_on_error(capsys):
     """Handler degrades to '?' when collect_contributions raises — never crashes the orchestrator."""
     coordinator = MagicMock()
-    coordinator.collect_contributions = AsyncMock(side_effect=RuntimeError("contributor exploded"))
+    coordinator.collect_contributions = AsyncMock(
+        side_effect=RuntimeError("contributor exploded")
+    )
 
     from amplifier_module_hooks_streaming_ui import _make_cost_handler
 
@@ -215,7 +217,9 @@ async def test_orchestrator_complete_skips_subsession_explicit_id(capsys):
 
     handler, state = _make_cost_handler(coordinator)
 
-    result = await handler("orchestrator:complete", {"session_id": "abc-def_agent-name"})
+    result = await handler(
+        "orchestrator:complete", {"session_id": "abc-def_agent-name"}
+    )
 
     captured = capsys.readouterr()
     assert captured.out == ""  # no 💰 line printed
