@@ -831,12 +831,13 @@ class TestTokenUsageCostDisplay:
 
 
 class TestStreamingOverlayLabel:
-    """The v3 transient overlay prints 'Amplifier:' permanently before Live starts
-    for text blocks, and suppresses it for thinking and sub-agent blocks."""
+    """The overlay does NOT print 'Amplifier:' for any block; the final response
+    label is owned exclusively by render_message in app-cli."""
 
     @pytest.mark.asyncio
-    async def test_label_printed_for_parent_text_block(self):
-        """Overlay prints 'Amplifier:' to a permanent line when a parent text block starts."""
+    async def test_label_not_printed_for_parent_text_block(self):
+        """Overlay must NOT print 'Amplifier:' when a parent text block starts.
+        render_message (which only ever renders the final response) owns the label."""
         import amplifier_module_hooks_streaming_ui as _mod
 
         buf = io.StringIO()
@@ -859,8 +860,8 @@ class TestStreamingOverlayLabel:
 
         assert isinstance(result, HookResult)
         assert result.action == "continue"
-        assert "Amplifier:" in buf.getvalue(), (
-            f"Expected 'Amplifier:' in stdout for text block; got: {buf.getvalue()!r}"
+        assert "Amplifier:" not in buf.getvalue(), (
+            f"'Amplifier:' must NOT appear in overlay output for text block; got: {buf.getvalue()!r}"
         )
 
     @pytest.mark.asyncio
