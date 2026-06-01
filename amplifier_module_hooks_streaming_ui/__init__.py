@@ -154,7 +154,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         # NOT content_block:* events (synthesized by loop-streaming).
         # This separation means the overlay and atomic renderer are on
         # independent event channels — no shared payload-field contract.
-        _overlay = _make_streaming_overlay()
+        _overlay = _make_streaming_overlay(hooks)
         coordinator.hooks.register(
             "llm:stream_block_start",
             _overlay["llm:stream_block_start"],
@@ -231,6 +231,11 @@ class StreamingUIHooks:
         # appear BELOW the rendered response rather than inserting above it.
         self._deferred_usage: tuple[str, str] | None = None  # (line1, line2)
         self._deferred_cost: str | None = None
+        # Per-session set of block indices that the overlay already painted as
+        # interleaved text (whisper/rail).  handle_content_block_end checks this
+        # to suppress the deferred duplicate render (Part 4 guard).
+        # Keyed by session_id (str); values are sets of int block indices.
+        self._overlay_painted_text: dict[str, set[int]] = {}
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
@@ -361,6 +366,62 @@ class StreamingUIHooks:
 
         return HookResult(action="continue")
 
+    def _paint_interleaved_text(self, text: str, agent_name: str | None) -> None:
+        """Paint an interleaved text block using whisper or rail style.
+
+        Called both by handle_content_block_end (deferred path) and by the
+        overlay's _on_content_block_start look-ahead (in-place path).  Extracted
+        from the original inline block so both callers share identical output.
+
+        Short text (< 3 rendered lines): whisper style — ▸ prefix, ANSI-256
+        colors 110 (glyph) and 188 (text).
+
+        Long text (≥ 3 rendered lines): rail style — ▍ on every line, ANSI-256
+        colors 103 (rail) and 145 (text).
+
+        Sub-agent (agent_name is not None): wrap_width=52, 4-space indent.
+        Parent (agent_name is None): wrap_width=60, no indent.
+
+        Args:
+            text:       The interleaved text to render.  Must be non-empty;
+                        callers are responsible for the strip() guard.
+            agent_name: Agent name for sub-agent indentation, or None for parent.
+        """
+        from io import StringIO
+
+        indent = "    " if agent_name else ""
+        wrap_width = 52 if agent_name else 60
+        buffer = StringIO()
+        temp_console = Console(file=buffer, highlight=False, width=wrap_width)
+        temp_console.print(Markdown(text))
+        rendered = buffer.getvalue()
+        lines = rendered.rstrip().split("\n")
+        line_count = len(lines)
+
+        # ANSI 256-color escape sequences
+        RESET = "\033[0m"
+
+        if line_count < 3:
+            # Whisper mode: ▸ prefix on first line, 2-space indent on continuation
+            GLYPH_COLOR = "\033[38;5;110m"  # Soft blue for ▸
+            TEXT_COLOR = "\033[38;5;188m"  # Muted warm white for text
+            print(
+                f"\n{indent}{GLYPH_COLOR}\u25b8{RESET} {TEXT_COLOR}{lines[0]}{RESET}"
+            )
+            for line in lines[1:]:
+                print(f"{indent}  {TEXT_COLOR}{line}{RESET}")
+            print()  # Blank line after
+        else:
+            # Rail mode: ▍ on every line
+            RAIL_COLOR = "\033[38;5;103m"  # Muted lavender for ▍
+            TEXT_COLOR = "\033[38;5;145m"  # Warm gray for text
+            print()  # Blank line before
+            for line in lines:
+                print(
+                    f"{indent}{RAIL_COLOR}\u258d{RESET} {TEXT_COLOR}{line}{RESET}"
+                )
+            print()  # Blank line after
+
     async def handle_content_block_end(
         self, _event: str, data: dict[str, Any]
     ) -> HookResult:
@@ -440,47 +501,25 @@ class StreamingUIHooks:
         # The final response (last block when stop_reason=end_turn) is rendered
         # by the main response path at full brightness.
         #
-        # v3: no streaming suppression here. The overlay no longer paints
-        # Markdown for text blocks, so there is no double-render risk.
+        # v3 + look-ahead fix: when the overlay is active, it paints interleaved
+        # text IN PLACE at the start of the NEXT block (look-ahead).  The index
+        # is recorded in self._overlay_painted_text so the deferred path here can
+        # skip the duplicate.  Sub-agent path (agent_name is not None) is
+        # unaffected — it always renders here.
         if block_type == "text" and not is_last_block and block.get("text", "").strip():
             text = block["text"]
-            indent = "    " if agent_name else ""
-
-            # Render through Rich Console + Markdown for proper line wrapping
-            # (matches the pattern used by thinking blocks above)
-            from io import StringIO
-
-            wrap_width = 52 if agent_name else 60
-            buffer = StringIO()
-            temp_console = Console(file=buffer, highlight=False, width=wrap_width)
-            temp_console.print(Markdown(text))
-            rendered = buffer.getvalue()
-            lines = rendered.rstrip().split("\n")
-            line_count = len(lines)
-
-            # ANSI 256-color escape sequences
-            RESET = "\033[0m"
-
-            if line_count < 3:
-                # Whisper mode: ▸ prefix on first line, 2-space indent on continuation
-                GLYPH_COLOR = "\033[38;5;110m"  # Soft blue for ▸
-                TEXT_COLOR = "\033[38;5;188m"  # Muted warm white for text
-                print(
-                    f"\n{indent}{GLYPH_COLOR}\u25b8{RESET} {TEXT_COLOR}{lines[0]}{RESET}"
-                )
-                for line in lines[1:]:
-                    print(f"{indent}  {TEXT_COLOR}{line}{RESET}")
-                print()  # Blank line after
+            # Guard: skip if the overlay already painted this block in-place.
+            # Only applies to parent sessions (agent_name is None); sub-agent
+            # text always falls through to the painter here.
+            sid_key = session_id or ""
+            painted_set = self._overlay_painted_text.get(sid_key)
+            if painted_set is not None and block_index in painted_set:
+                # Overlay already rendered this block — suppress the duplicate.
+                painted_set.discard(block_index)
+                if not painted_set:
+                    del self._overlay_painted_text[sid_key]
             else:
-                # Rail mode: ▍ on every line
-                RAIL_COLOR = "\033[38;5;103m"  # Muted lavender for ▍
-                TEXT_COLOR = "\033[38;5;145m"  # Warm gray for text
-                print()  # Blank line before
-                for line in lines:
-                    print(
-                        f"{indent}{RAIL_COLOR}\u258d{RESET} {TEXT_COLOR}{line}{RESET}"
-                    )
-                print()  # Blank line after
+                self._paint_interleaved_text(text, agent_name)
 
         # Display token usage after last block (if present and configured)
         if is_last_block and self.show_token_usage and usage:
@@ -1167,7 +1206,7 @@ def _thinking_renderable(
     )
 
 
-def _make_streaming_overlay():
+def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
     """v3 Transient Streaming Overlay.
 
     Per-block transient regions bounded by llm:stream_block_start and
@@ -1237,6 +1276,13 @@ def _make_streaming_overlay():
         for block in s["blocks"].values():
             _close_live(block)
         s["blocks"] = {}
+        # Part 5: clear pending interleaved-text stash so it doesn't leak
+        # into the next turn (the FINAL text block becomes pending but never
+        # has a next-block-start; reset clears it before the next turn).
+        s.pop("pending_text", None)
+        # Also clear the hooks-side painting record for this session so
+        # handle_content_block_end doesn't see stale indices from a prior turn.
+        hooks_instance._overlay_painted_text.pop(sid, None)
 
     async def _on_content_block_start(_event: str, data: dict[str, Any]) -> HookResult:
         sid = data.get("session_id") or ""
@@ -1245,6 +1291,26 @@ def _make_streaming_overlay():
         if idx is None:
             return HookResult(action="continue")
         s = _get_session(sid)
+
+        # Part 3 — look-ahead: drain any pending interleaved text stashed at
+        # the end of the PREVIOUS text block.  We paint it NOW, in-order,
+        # directly below its "Amplifier:" label, BEFORE printing this new
+        # block's placeholder / Live region.  This keeps [text][tool_use]
+        # rendering as: label → whisper/rail → "🔧 Building tool call" with no
+        # orphaned label and no late-pop after the tool placeholder.
+        #
+        # Only applies to parent sessions (pending_text is only stored for
+        # agent is None paths); sub-agent sessions never set pending_text.
+        pending = s.pop("pending_text", None)
+        if pending is not None and pending["buffer"].strip():
+            hooks_instance._paint_interleaved_text(
+                pending["buffer"], pending["agent_name"]
+            )
+            # Record in hooks-side set so handle_content_block_end skips it
+            # (Part 4 guard — suppress the deferred duplicate render).
+            painted = hooks_instance._overlay_painted_text.setdefault(sid, set())
+            painted.add(pending["index"])
+
         block: dict[str, Any] = {
             "type": btype,
             "buffer": "",
@@ -1440,8 +1506,7 @@ def _make_streaming_overlay():
             # on StreamingUIHooks) sees overlay_active=True and skips the
             # re-paint, avoiding a duplicate framed block.
             #
-            # Text/response blocks: no inline paint here — the atomic renderer
-            # and main.py still own those final displays.
+            # Text/response blocks: no inline paint here — see Part 2 below.
             # Tool_use blocks: no Live was opened; nothing to close. The
             # tool:pre/tool:post flow handles the formatted box.
             if btype == "thinking" and buffer.strip():
@@ -1455,6 +1520,25 @@ def _make_streaming_overlay():
                     )
                 except Exception:
                     pass
+
+            # Part 2 — look-ahead stash: for parent text blocks, don't paint
+            # now.  We don't yet know whether there is a NEXT block (which
+            # would mean this is interleaved, not the final response).  Stash
+            # the finished buffer in the session state; _on_content_block_start
+            # for the NEXT block will drain it, paint it in-place, and record
+            # the index so handle_content_block_end skips the duplicate.
+            #
+            # If there IS no next block (final response / end-of-turn), the
+            # stash is cleaned up by _reset_session (called from
+            # _on_prompt_submit / _on_llm_stream_aborted / _on_provider_retry)
+            # and handle_content_block_end renders it via the existing
+            # is_last_block → render_message path unchanged.
+            if btype == "text" and buffer.strip():
+                s["pending_text"] = {
+                    "index": idx,
+                    "buffer": buffer,
+                    "agent_name": agent,  # None for parent sessions
+                }
         else:
             # Sub-agent: flush any trailing partial line.
             tail = buffer
@@ -1484,6 +1568,9 @@ def _make_streaming_overlay():
             except BrokenPipeError:
                 pass
         s["blocks"] = {}
+        # Part 5: clear stash on abort so it doesn't leak into the next turn.
+        s.pop("pending_text", None)
+        hooks_instance._overlay_painted_text.pop(sid, None)
         return HookResult(action="continue")
 
     async def _on_provider_retry(_event: str, data: dict[str, Any]) -> HookResult:
@@ -1503,6 +1590,9 @@ def _make_streaming_overlay():
             except BrokenPipeError:
                 pass
         s["blocks"] = {}
+        # Part 5: clear stash on retry so it doesn't leak into the retried turn.
+        s.pop("pending_text", None)
+        hooks_instance._overlay_painted_text.pop(sid, None)
         return HookResult(action="continue")
 
     async def _on_prompt_submit(_event: str, data: dict[str, Any]) -> HookResult:
