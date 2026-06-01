@@ -366,7 +366,13 @@ class StreamingUIHooks:
 
         return HookResult(action="continue")
 
-    def _paint_interleaved_text(self, text: str, agent_name: str | None) -> None:
+    def _paint_interleaved_text(
+        self,
+        text: str,
+        agent_name: str | None,
+        *,
+        omit_trailing_blank: bool = False,
+    ) -> None:
         """Paint an interleaved text block using the appropriate renderable.
 
         Called both by handle_content_block_end (deferred/final path) and by the
@@ -395,7 +401,13 @@ class StreamingUIHooks:
             # do NOT add a second one.  Add ONE trailing blank for separation.
             out = Console(file=sys.stdout, highlight=False)
             out.print(_text_renderable(text))
-            print()
+            if not omit_trailing_blank:
+                # The final response is immediately followed by the Token Usage
+                # panel, which supplies its OWN leading blank line. Emitting our
+                # trailing blank too would stack into a double blank. Interleaved
+                # asides keep the trailing blank because the following tool-call
+                # placeholder has no leading blank of its own.
+                print()
         else:
             # Sub-agent: unchanged rail rendering.
             print()  # Blank line before
@@ -507,7 +519,15 @@ class StreamingUIHooks:
                 if not painted_set:
                     del self._overlay_painted_text[sid_key]
             else:
-                self._paint_interleaved_text(text, agent_name)
+                # When this is the final response AND the Token Usage panel will
+                # follow (it brings its own leading blank), omit our trailing
+                # blank so the two don't stack into a double blank line.
+                will_show_usage = bool(
+                    is_last_block and self.show_token_usage and usage
+                )
+                self._paint_interleaved_text(
+                    text, agent_name, omit_trailing_blank=will_show_usage
+                )
 
         # Display token usage after last block (if present and configured)
         if is_last_block and self.show_token_usage and usage:

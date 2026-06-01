@@ -327,3 +327,34 @@ class TestOverlayLookAheadStateMachine:
         assert paint_mock.call_count == 0, (
             f"Painter should not be called after reset; got {paint_mock.call_count} calls"
         )
+
+
+# ---------------------------------------------------------------------------
+# Final-response trailing-blank suppression (avoid double blank before Token Usage)
+# ---------------------------------------------------------------------------
+
+
+def _trailing_newlines(s: str) -> int:
+    n = 0
+    for ch in reversed(s):
+        if ch == "\n":
+            n += 1
+        else:
+            break
+    return n
+
+
+def test_final_paint_omits_one_trailing_blank(capsys):
+    """The final response (omit_trailing_blank=True) emits exactly one fewer
+    trailing newline than an interleaved aside, so it doesn't stack with the
+    Token Usage panel's own leading blank into a double blank line."""
+    hooks = _hooks()
+
+    hooks._paint_interleaved_text("Body text.", None, omit_trailing_blank=False)
+    with_blank = capsys.readouterr().out
+
+    hooks._paint_interleaved_text("Body text.", None, omit_trailing_blank=True)
+    without_blank = capsys.readouterr().out
+
+    assert "Amplifier:" in without_blank and "Body text." in without_blank
+    assert _trailing_newlines(with_blank) == _trailing_newlines(without_blank) + 1
