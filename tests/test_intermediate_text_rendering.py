@@ -180,10 +180,17 @@ async def test_empty_text_block_skipped(capsys):
 
 
 @pytest.mark.asyncio
-async def test_sub_agent_text_indented(capsys):
-    """Sub-agent intermediate text should be indented with 4 spaces."""
+async def test_sub_agent_intermediate_text_suppressed(capsys):
+    """Sub-agent intermediate text (not last block) is SUPPRESSED.
+
+    Changed in feat/subagent-curated (change 4): intermediate sub-agent asides
+    are no longer rendered — only the final result is shown, attributed.
+    The old test 'test_sub_agent_text_indented' asserted the opposite (painted);
+    updated to the new curated model.
+    """
     hooks = _hooks()
-    # Sub-agent session IDs contain an underscore followed by the agent name
+    # Sub-agent session IDs contain an underscore followed by the agent name.
+    # total_blocks=2, block_index=0 → NOT last block (is_last_block=False).
     data = _text_block_end_event(
         "Checking the module structure.",
         session_id="0000000000000000-7cc787dd22d54f6c_foundation:explorer",
@@ -192,10 +199,43 @@ async def test_sub_agent_text_indented(capsys):
     await hooks.handle_content_block_end("content_block:end", data)
 
     captured = capsys.readouterr()
+    # Intermediate sub-agent text must produce NO output (suppressed).
+    assert captured.out == "", (
+        f"Intermediate sub-agent text must be suppressed; got: {captured.out!r}"
+    )
+    assert captured.err == "", (
+        f"No stderr for sub-agent intermediate text; got: {captured.err!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_final_text_attributed(capsys):
+    """Sub-agent FINAL text (last block) is rendered with [agent_name] attribution.
+
+    feat/subagent-curated change 4: when is_last_block=True, the sub-agent result
+    is painted with a dim-cyan [agent_name] header followed by the rail body.
+    """
+    hooks = _hooks()
+    # block_index=0, total_blocks=1 → is_last_block=True
+    data = _text_block_end_event(
+        "The answer is 42.",
+        block_index=0,
+        total_blocks=1,
+        session_id="0000000000000000-7cc787dd22d54f6c_foundation:explorer",
+    )
+
+    await hooks.handle_content_block_end("content_block:end", data)
+
+    captured = capsys.readouterr()
     output = captured.out
-    # The text should appear with 4-space indentation
-    assert "    " in output
-    assert "Checking the module structure." in output
+    # Attribution header must appear
+    assert "[foundation:explorer]" in output, (
+        f"Attribution header missing from sub-agent final result; got: {output!r}"
+    )
+    # Result text must appear
+    assert "The answer is 42." in output, (
+        f"Result text missing from sub-agent final result; got: {output!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
