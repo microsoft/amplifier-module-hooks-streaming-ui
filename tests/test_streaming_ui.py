@@ -830,14 +830,54 @@ class TestTokenUsageCostDisplay:
 # ---------------------------------------------------------------------------
 
 
+class TestTextRenderable:
+    """_text_renderable leads streaming parent text with a transient bold-green
+    'Amplifier:' label above the markdown body (Option C)."""
+
+    def test_includes_label_and_content(self):
+        import amplifier_module_hooks_streaming_ui as _mod
+        from rich.console import Console
+
+        b = io.StringIO()
+        Console(file=b, width=80, force_terminal=False).print(
+            _mod._text_renderable("hello world")
+        )
+        out = b.getvalue()
+        assert "Amplifier:" in out
+        assert "hello world" in out
+
+    def test_empty_content_still_shows_label(self):
+        import amplifier_module_hooks_streaming_ui as _mod
+        from rich.console import Console
+
+        b = io.StringIO()
+        Console(file=b, width=80, force_terminal=False).print(_mod._text_renderable(""))
+        assert "Amplifier:" in b.getvalue()
+
+    def test_label_precedes_body(self):
+        import amplifier_module_hooks_streaming_ui as _mod
+        from rich.console import Console
+
+        b = io.StringIO()
+        Console(file=b, width=80, force_terminal=False).print(
+            _mod._text_renderable("the body text")
+        )
+        out = b.getvalue()
+        assert out.index("Amplifier:") < out.index("the body text")
+
+
 class TestStreamingOverlayLabel:
-    """The overlay does NOT print 'Amplifier:' for any block; the final response
-    label is owned exclusively by render_message in app-cli."""
+    """The overlay never prints 'Amplifier:' PERMANENTLY (no direct
+    parent_console.print). For text blocks the label now leads the text
+    *inside* the transient Live region via _text_renderable, so it clears
+    with the stream: interleaved asides settle to whisper/rail (no label),
+    and the final response's persistent label is owned by render_message."""
 
     @pytest.mark.asyncio
     async def test_label_not_printed_for_parent_text_block(self):
-        """Overlay must NOT print 'Amplifier:' when a parent text block starts.
-        render_message (which only ever renders the final response) owns the label."""
+        """Overlay must NOT print 'Amplifier:' as a permanent line when a parent
+        text block starts (the label lives inside the transient Live instead;
+        see TestTextRenderable). With Live mocked, no direct print should occur."""
         import amplifier_module_hooks_streaming_ui as _mod
 
         buf = io.StringIO()

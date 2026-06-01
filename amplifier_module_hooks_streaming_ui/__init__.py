@@ -405,9 +405,7 @@ class StreamingUIHooks:
             # Whisper mode: ▸ prefix on first line, 2-space indent on continuation
             GLYPH_COLOR = "\033[38;5;110m"  # Soft blue for ▸
             TEXT_COLOR = "\033[38;5;188m"  # Muted warm white for text
-            print(
-                f"\n{indent}{GLYPH_COLOR}\u25b8{RESET} {TEXT_COLOR}{lines[0]}{RESET}"
-            )
+            print(f"\n{indent}{GLYPH_COLOR}\u25b8{RESET} {TEXT_COLOR}{lines[0]}{RESET}")
             for line in lines[1:]:
                 print(f"{indent}  {TEXT_COLOR}{line}{RESET}")
             print()  # Blank line after
@@ -417,9 +415,7 @@ class StreamingUIHooks:
             TEXT_COLOR = "\033[38;5;145m"  # Warm gray for text
             print()  # Blank line before
             for line in lines:
-                print(
-                    f"{indent}{RAIL_COLOR}\u258d{RESET} {TEXT_COLOR}{line}{RESET}"
-                )
+                print(f"{indent}{RAIL_COLOR}\u258d{RESET} {TEXT_COLOR}{line}{RESET}")
             print()  # Blank line after
 
     async def handle_content_block_end(
@@ -1206,6 +1202,32 @@ def _thinking_renderable(
     )
 
 
+def _text_renderable(content: str) -> Any:
+    """Return a Rich renderable for a streaming parent *text* block.
+
+    Renders as: a blank separator line, a bold-green ``Amplifier:`` label,
+    then the markdown body. The label lives INSIDE the transient Live region
+    (it is NOT printed permanently), so it clears together with the streamed
+    text when the block ends:
+
+      - interleaved asides clear and finalize to the muted whisper/rail note
+        (no label) -- the label was only a transient "assistant is speaking"
+        marker during the aside's stream.
+      - the final response clears and is re-rendered by app-cli's
+        render_message, which prints its own ``Amplifier:`` + markdown -- so
+        the label persists ONLY for the final response.
+
+    Used for both ``Live.update()`` during streaming and the height
+    measurement in :func:`_fit_tail_to_height`, so the budget arithmetic
+    accounts for the two leading lines (blank + label).
+    """
+    return Group(
+        Text(""),
+        Text("Amplifier:", style="bold green"),
+        Markdown(content),
+    )
+
+
 def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
     """v3 Transient Streaming Overlay.
 
@@ -1349,7 +1371,9 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                             w = 80
                         initial: Any = _thinking_renderable("", width=w)
                     else:
-                        initial = Markdown("")
+                        # Text blocks lead with the bold-green "Amplifier:"
+                        # label INSIDE the transient Live (see _text_renderable).
+                        initial = _text_renderable("")
                     live = Live(
                         initial,
                         console=parent_console,
@@ -1434,14 +1458,17 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                             text_height = parent_console.size.height
                         except Exception:
                             text_height = 24
-                        budget = max(5, text_height - 5)
+                        # Reserve 2 lines for the blank separator + "Amplifier:"
+                        # label that _text_renderable prepends, so the Live
+                        # region (label + body) stays within terminal height.
+                        budget = max(5, text_height - 5 - 2)
                         tail = _fit_tail_to_height(
                             block["buffer"],
                             budget,
-                            Markdown,
+                            _text_renderable,
                             parent_console,
                         )
-                        live.update(Markdown(tail))
+                        live.update(_text_renderable(tail))
                 except Exception:
                     pass
             else:
