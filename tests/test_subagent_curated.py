@@ -493,6 +493,34 @@ class TestChange5TaskToolDedup:
         assert "Tool result: task" not in captured.out
 
     @pytest.mark.asyncio
+    async def test_delegate_tool_success_shape_suppressed(self, capsys):
+        """delegate tool (current spawn-tool name) with a response-shaped result
+        -> body suppressed, same as the task alias."""
+        hooks = _hooks()
+
+        result = await hooks.handle_tool_post(
+            "tool:post",
+            {
+                "tool_name": "delegate",
+                "tool_response": {
+                    "response": "The delegated agent finished its work.",
+                    "session_id": _SUB_SID,
+                    "metadata": {},
+                    "provider_routing": {"model_role": "fast"},
+                },
+            },
+        )
+
+        assert isinstance(result, HookResult)
+        assert result.action == "continue"
+
+        captured = capsys.readouterr()
+        assert "The delegated agent finished its work." not in captured.out
+        assert "Tool result: delegate" not in captured.out
+        # The routing envelope must not leak either
+        assert "provider_routing" not in captured.out
+
+    @pytest.mark.asyncio
     async def test_task_tool_error_shape_rendered(self, capsys):
         """task tool with error-shaped result (no 'response' key) renders normally."""
         hooks = _hooks()
