@@ -840,9 +840,12 @@ class TestStreamingOverlayLabel:
         import amplifier_module_hooks_streaming_ui as _mod
 
         buf = io.StringIO()
+        hooks_stub = _mod.StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
         with patch.object(_mod, "Live") as mock_live_cls, patch("sys.stdout", buf):
             mock_live_cls.return_value = MagicMock()
-            overlay = _mod._make_streaming_overlay()
+            overlay = _mod._make_streaming_overlay(hooks_stub)
             handler = overlay["llm:stream_block_start"]
 
             result = await handler(
@@ -866,9 +869,12 @@ class TestStreamingOverlayLabel:
         import amplifier_module_hooks_streaming_ui as _mod
 
         buf = io.StringIO()
+        hooks_stub = _mod.StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
         with patch.object(_mod, "Live") as mock_live_cls, patch("sys.stdout", buf):
             mock_live_cls.return_value = MagicMock()
-            overlay = _mod._make_streaming_overlay()
+            overlay = _mod._make_streaming_overlay(hooks_stub)
             handler = overlay["llm:stream_block_start"]
 
             result = await handler(
@@ -891,9 +897,12 @@ class TestStreamingOverlayLabel:
         import amplifier_module_hooks_streaming_ui as _mod
 
         buf = io.StringIO()
+        hooks_stub = _mod.StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
         with patch.object(_mod, "Live") as mock_live_cls, patch("sys.stdout", buf):
             mock_live_cls.return_value = MagicMock()
-            overlay = _mod._make_streaming_overlay()
+            overlay = _mod._make_streaming_overlay(hooks_stub)
             handler = overlay["llm:stream_block_start"]
 
             # Sub-agent session IDs contain an underscore after the span portion.
