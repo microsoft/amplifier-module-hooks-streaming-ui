@@ -498,15 +498,24 @@ class TestChange5TaskToolDedup:
         -> body suppressed, same as the task alias."""
         hooks = _hooks()
 
+        # Real delegate envelope shape (verified from a live tool:post event):
+        # the response is NESTED under "output", with routing metadata around it.
         result = await hooks.handle_tool_post(
             "tool:post",
             {
                 "tool_name": "delegate",
                 "tool_response": {
-                    "response": "The delegated agent finished its work.",
-                    "session_id": _SUB_SID,
-                    "metadata": {},
-                    "provider_routing": {"model_role": "fast"},
+                    "error": None,
+                    "success": True,
+                    "output": {
+                        "agent": "foundation:explorer",
+                        "response": "The delegated agent finished its work.",
+                        "session_id": _SUB_SID,
+                        "metadata": {},
+                        "provider_routing": {"model_role": "fast"},
+                        "status": "success",
+                        "turn_count": 7,
+                    },
                 },
             },
         )
