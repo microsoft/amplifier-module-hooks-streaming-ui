@@ -494,45 +494,44 @@ class StreamingUIHooks:
 
         # Paint text blocks.
         #
-        # PARENT (agent_name is None): owns the final-response render.
+        # PARENT (agent_name is None): paints interleaved ASIDES only; skips the final.
+        # app-cli's render_message is the SOLE owner of the final-response render —
+        # this avoids the #256 double-render that the two-sided coordination caused.
         # The overlay's look-ahead stash (pending_text) handles INTERLEAVED asides:
         # it paints them IN PLACE at the start of the NEXT block, records the index
         # in self._overlay_painted_text, and the guard below suppresses the duplicate
-        # here.  The FINAL text block has no following block — it is never stashed
-        # by the look-ahead — so it falls through to _paint_interleaved_text and
-        # gets painted here via the uniform _text_renderable (Amplifier: + Markdown).
+        # here.  The FINAL text block (is_last_block=True) is skipped entirely — the
+        # hook no longer owns it.
         #
-        # SUB-AGENT (agent_name is not None) — Change 4:
+        # SUB-AGENT (agent_name is not None) — Change 4 (unchanged):
         # Intermediate asides (not is_last_block) are SUPPRESSED.
         # Final result (is_last_block) is painted ATTRIBUTED via
-        # _paint_interleaved_text, which renders a dim-cyan [agent_name] header
-        # above the _rail_renderable body so the reader can tell whose result it is.
+        # _paint_interleaved_text, which renders a dim-cyan [agent_name] label
+        # above a full-width dimmed Markdown body (same layout as parent).
         if block_type == "text" and block.get("text", "").strip():
             text = block["text"]
             if agent_name is None:
-                # Parent path: guard against overlay duplicate; then paint (unchanged).
-                sid_key = session_id or ""
-                painted_set = self._overlay_painted_text.get(sid_key)
-                if painted_set is not None and block_index in painted_set:
-                    # Overlay already rendered this block — suppress the duplicate.
-                    painted_set.discard(block_index)
-                    if not painted_set:
-                        del self._overlay_painted_text[sid_key]
+                # PARENT (agent_name is None): paints interleaved ASIDES only.
+                # The hook no longer owns the final-response render — app-cli's
+                # render_message is the single owner (fixes #256 double-render).
+                if is_last_block:
+                    pass  # app-cli's render_message owns the final response (single owner; fixes #256 double-render)
                 else:
-                    # When this is the final response AND the Token Usage panel will
-                    # follow (it brings its own leading blank), omit our trailing
-                    # blank so the two don't stack into a double blank line.
-                    will_show_usage = bool(
-                        is_last_block and self.show_token_usage and usage
-                    )
-                    # Settled asides (not the final response) are dimmed so they
-                    # recede when scrolling back; the final response stays bright.
-                    self._paint_interleaved_text(
-                        text,
-                        agent_name,
-                        omit_trailing_blank=will_show_usage,
-                        dim=not is_last_block,
-                    )
+                    # Interleaved aside: guard against overlay duplicate; then paint dimmed.
+                    sid_key = session_id or ""
+                    painted_set = self._overlay_painted_text.get(sid_key)
+                    if painted_set is not None and block_index in painted_set:
+                        # Overlay already rendered this block — suppress the duplicate.
+                        painted_set.discard(block_index)
+                        if not painted_set:
+                            del self._overlay_painted_text[sid_key]
+                    else:
+                        # Interleaved asides are dimmed so they recede when scrolling back.
+                        self._paint_interleaved_text(
+                            text,
+                            agent_name,
+                            dim=True,
+                        )
             else:
                 # Sub-agent (change 4): suppress intermediate asides;
                 # render only the final result, attributed with agent name.
@@ -612,10 +611,9 @@ class StreamingUIHooks:
             line2 = f"{indent}\033[2m└─ Input: {input_str}{cache_info} | Output: {output_str} | Total: {total_str}{cost_part}\033[0m"
 
             if self.overlay_active and block_type == "text":
-                # Defer to cleanup:render_end (fires after the hook paints the
-                # response in handle_content_block_end, then app-cli emits
-                # render_end).  This prevents usage from inserting above the
-                # response — it will appear below it instead.
+                # Defer to cleanup:render_end (fires after app-cli's render_message
+                # paints the final response).  This ensures Token Usage appears BELOW
+                # the response rather than inserting above it.
                 self._deferred_usage = (line1, line2)
             else:
                 # Inline print: overlay inactive, or last block is not a text
@@ -1296,17 +1294,16 @@ def _text_renderable(content: str, *, dim: bool = False) -> Any:
         token streaming (transient — clears when block ends).
       - settled interleaved asides: ``_paint_interleaved_text`` for parent
         sessions, which calls ``Console.print(_text_renderable(text))``.
-      - final response: ``handle_content_block_end`` now paints the final
-        text block via ``_paint_interleaved_text`` as well.
+      - final response: painted by app-cli's ``render_message`` (sole owner,
+        #256 fix); the hook no longer settle-paints the final text block.
 
-    Because the streaming preview, settled asides, and final response all
-    use this same renderable, there is NO snap at settle time — the output
-    is byte-identical.
+    Because the streaming preview and settled asides all use this same
+    renderable, there is NO snap at settle time — the output is byte-identical.
 
     The label lives INSIDE the transient Live region (it is NOT printed
     permanently during streaming), so it clears together with the streamed
-    text when the block ends.  On settle / final paint it is printed once
-    via ``console.print``.
+    text when the block ends.  On settle (aside) it is printed once via
+    ``Console.print``; on final it is NOT reprinted (app-cli owns it).
 
     Used for both ``Live.update()`` during streaming and the height
     measurement in :func:`_fit_tail_to_height`, so the budget arithmetic
@@ -1643,10 +1640,10 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
             #
             # If there IS no next block (final response / end-of-turn), the
             # stash is held here and cleaned up later:
-            #   - handle_content_block_end is the SOLE painter of the final
-            #     text block: it falls through to _paint_interleaved_text
-            #     (not in _overlay_painted_text → not skipped) and renders
-            #     via the uniform _text_renderable (Amplifier: + Markdown).
+            #   - handle_content_block_end SKIPS the final text block (#256 fix)
+            #     — app-cli's render_message is the sole owner of the final paint.
+            #     The stash is never drained for the final block (no next-block-start
+            #     to trigger the look-ahead drain); it is discarded by _reset_session.
             #   - _reset_session (from _on_prompt_submit / _on_llm_stream_aborted
             #     / _on_provider_retry) clears any leftover stash without painting.
             if btype == "text" and buffer.strip():
