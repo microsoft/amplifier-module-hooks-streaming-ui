@@ -82,6 +82,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_tool_lines = ui_config.get("show_tool_lines", 5)
     show_token_usage = ui_config.get("show_token_usage", True)
     stream_tokens = ui_config.get("stream_tokens", False)
+    spawn_tools = ui_config.get("spawn_tools", ["task", "delegate"])
 
     # Determine overlay state up front so the atomic renderer can skip
     # thinking re-paints that the overlay already owns.
@@ -90,7 +91,11 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
 
     # Create hook handlers
     hooks = StreamingUIHooks(
-        show_thinking, show_tool_lines, show_token_usage, overlay_active=overlay_active
+        show_thinking,
+        show_tool_lines,
+        show_token_usage,
+        overlay_active=overlay_active,
+        spawn_tools=spawn_tools,
     )
 
     # Register atomic handlers (existing — unchanged in v2)
@@ -207,6 +212,7 @@ class StreamingUIHooks:
         show_tool_lines: int,
         show_token_usage: bool,
         overlay_active: bool = False,
+        spawn_tools: tuple[str, ...] = ("task", "delegate"),
     ):
         """Initialize streaming UI hooks.
 
@@ -218,6 +224,10 @@ class StreamingUIHooks:
                 When True, the atomic renderer skips parent thinking re-paints
                 because the overlay already painted them permanently at block-end.
                 When False (default), the atomic renderer paints them as before.
+            spawn_tools: Tool names that spawn sub-agents.  Any tool whose name
+                appears in this tuple triggers per-agent list tracking.
+                Default: ("task", "delegate").  Configurable via
+                ``ui.spawn_tools`` in the mount config.
         """
         self.show_thinking = show_thinking
         self.show_tool_lines = show_tool_lines
@@ -238,33 +248,47 @@ class StreamingUIHooks:
         # to suppress the deferred duplicate render (Part 4 guard).
         # Keyed by session_id (str); values are sets of int block indices.
         self._overlay_painted_text: dict[str, set[int]] = {}
-        # Sub-agent spinner state.
-        # _subagents_running: counter incremented on delegate/task tool:pre,
-        # decremented on tool:post.  Count > 0 → ≥1 sub-agent is running.
+        # Sub-agent live-panel state.
+        # _spawn_tools: names of tools that spawn sub-agents (config-driven).
+        # _active_spawns: ordered dict mapping tool_call_id -> agent_label for
+        #     every currently-running sub-agent spawn.  One row per entry in the
+        #     live panel.  Insertion-ordered so rows render in spawn order.
+        # _spawn_counter: fallback key counter when tool_call_id is absent.
         # _spinner_live: singleton Rich Live; lazily created on first spawn.
-        # _spinner_console: dedicated stdout Console for the spinner.
-        # _is_tty: cached isatty() result; spinner only starts on TTY.
-        self._subagents_running: int = 0
+        # _spinner_console: dedicated stdout Console for the live panel.
+        # _is_tty: cached isatty() result; live panel only starts on TTY.
+        self._spawn_tools: tuple[str, ...] = tuple(spawn_tools)
+        self._active_spawns: dict[str, str] = {}
+        self._spawn_counter: int = 0
         self._spinner_live: Live | None = None
         self._spinner_console: Console = Console(file=sys.stdout)
         self._is_tty: bool = getattr(sys.stdout, "isatty", lambda: False)()
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
-    def _make_spinner_renderable(self, n: int) -> _RichSpinner:
-        """Return a Spinner renderable labelled for *n* active sub-agents."""
-        label = f"\u23f3 {n} sub-agent{'s' if n != 1 else ''} working\u2026"
-        return _RichSpinner("dots", text=Text(label, style="dim"))
+    def _make_spawns_renderable(self) -> Any:
+        """Return a Rich Group showing the live per-agent panel.
+
+        Header: an animated "dots" spinner with the agent count.
+        Body: one dim row per active spawn, labelled with the agent name.
+        """
+        labels = list(self._active_spawns.values())
+        n = len(labels)
+        header = _RichSpinner(
+            "dots",
+            text=Text(f" {n} agent{'s' if n != 1 else ''} working", style="dim"),
+        )
+        rows = [Text(f"   \u258d {label}", style="dim") for label in labels]
+        return Group(header, *rows)
 
     def _start_or_update_spinner(self) -> None:
-        """Start the spinner if not running, or update its text.
+        """Start the live panel if not running, or update its content.
 
         TTY-gated: no-op when stdout is not a TTY.
         """
         if not self._is_tty:
             return
-        n = self._subagents_running
-        renderable = self._make_spinner_renderable(n)
+        renderable = self._make_spawns_renderable()
         if self._spinner_live is None:
             self._spinner_live = Live(
                 renderable,
@@ -278,21 +302,21 @@ class StreamingUIHooks:
             self._spinner_live.start()
 
     def _stop_spinner(self) -> None:
-        """Stop the spinner if it is currently running (transient clears it)."""
+        """Stop the live panel if it is currently running (transient clears it)."""
         if self._spinner_live is not None and self._spinner_live.is_started:
             self._spinner_live.stop()
 
     @contextmanager
     def _with_spinner_paused(self):  # type: ignore[return]
-        """Context manager: pause the spinner, do work, then resume.
+        """Context manager: pause the live panel, do work, then resume.
 
         While the spinner Live is active, plain print() / Console.print()
         calls corrupt the live region.  This context manager temporarily stops
-        the spinner (transient clears it), lets the caller print safely, then
-        restarts it if the sub-agent counter is still >0.
+        the panel (transient clears it), lets the caller print safely, then
+        restarts it if there are still active spawns.
 
         Use for every sub-agent print (tool frames and final result).  Never
-        use for parent prints -- the parent never prints while count>0.
+        use for parent prints -- the parent never prints while spawns are active.
         """
         live = self._spinner_live
         was_started = live is not None and live.is_started
@@ -301,8 +325,8 @@ class StreamingUIHooks:
         try:
             yield
         finally:
-            if was_started and self._subagents_running > 0 and live is not None:
-                live.update(self._make_spinner_renderable(self._subagents_running))
+            if was_started and len(self._active_spawns) > 0 and live is not None:
+                live.update(self._make_spawns_renderable())
                 live.start()
 
     def _compute_total_input(self, usage: dict) -> int:
@@ -717,9 +741,9 @@ class StreamingUIHooks:
             └─ Input: ... | Output: ...
             💰 Turn: ... | Session: ... ← flushed here
         """
-        # Reset spinner state at turn end — safety net for any aborted/stale
-        # sub-agent runs that didn't decrement the counter cleanly via tool:post.
-        self._subagents_running = 0
+        # Reset live-panel state at turn end — safety net for any aborted/stale
+        # sub-agent runs that didn't clean up cleanly via tool:post.
+        self._active_spawns.clear()
         self._stop_spinner()
 
         if self._deferred_usage is not None or self._deferred_cost is not None:
@@ -756,13 +780,13 @@ class StreamingUIHooks:
         input_str = self._format_for_display(tool_input)
         truncated = self._truncate_lines(input_str, self.show_tool_lines)
 
-        is_spawn = tool_name in ("task", "delegate")
+        is_spawn = tool_name in self._spawn_tools
 
         if agent_name:
             # Sub-agent tool call: route through spinner-pause to avoid corrupting
-            # the live spinner region.  The print must happen BEFORE counter
-            # increment so the pause is a no-op when the spinner isn't running yet
-            # (first-ever sub-agent call within this agent's scope).
+            # the live panel.  The print must happen BEFORE tracking so the pause
+            # is a no-op when the panel isn't running yet (first-ever sub-agent
+            # call within this agent's scope).
             with self._with_spinner_paused():
                 print(
                     f"\n    \033[36m┌─ 🔧 [{agent_name}] Using tool: {tool_name}\033[0m"
@@ -770,20 +794,34 @@ class StreamingUIHooks:
                 # Indent each line of arguments
                 for line in truncated.split("\n"):
                     print(f"    \033[36m│\033[0m  \033[2m{line}\033[0m")
-            # For nested spawns: increment counter and update spinner AFTER print.
+            # For nested spawns: add to active tracking and update panel AFTER print.
             if is_spawn:
-                self._subagents_running += 1
+                tool_call_id = data.get("tool_call_id")
+                if not tool_call_id:
+                    self._spawn_counter += 1
+                    tool_call_id = f"_fallback_{self._spawn_counter}"
+                agent_label = (
+                    (tool_input or {}).get("agent") or tool_name or "sub-agent"
+                )
+                self._active_spawns[tool_call_id] = agent_label
                 self._start_or_update_spinner()
         else:
-            # Parent tool call: parent never prints while count>0, so the spinner
-            # is NOT running yet on the first spawn.  Print first, then start it.
+            # Parent tool call: parent never prints while spawns are active, so the
+            # panel is NOT running yet on the first spawn.  Print first, then start.
             print(f"\n\033[36m🔧 Using tool: {tool_name}\033[0m")
             # Indent each line of arguments
             for line in truncated.split("\n"):
                 print(f"   \033[2m{line}\033[0m")
-            # For spawn tools: increment counter and start spinner AFTER printing.
+            # For spawn tools: add to active tracking and start panel AFTER printing.
             if is_spawn:
-                self._subagents_running += 1
+                tool_call_id = data.get("tool_call_id")
+                if not tool_call_id:
+                    self._spawn_counter += 1
+                    tool_call_id = f"_fallback_{self._spawn_counter}"
+                agent_label = (
+                    (tool_input or {}).get("agent") or tool_name or "sub-agent"
+                )
+                self._active_spawns[tool_call_id] = agent_label
                 self._start_or_update_spinner()
 
         return HookResult(action="continue")
@@ -803,12 +841,13 @@ class StreamingUIHooks:
         tool_name = data.get("tool_name", "unknown")
         result = data.get("tool_response", data.get("result", {}))
         session_id = data.get("session_id")
+        tool_call_id = data.get("tool_call_id")
 
-        # Spinner counter: decrement for spawn tools BEFORE any early return so the
-        # counter is always balanced with handle_tool_pre regardless of result shape.
-        if tool_name in ("task", "delegate"):
-            self._subagents_running = max(0, self._subagents_running - 1)
-            if self._subagents_running == 0:
+        # Live-panel tracking: remove the completed spawn BEFORE any early return so
+        # the row is always cleaned up regardless of result shape.
+        if tool_name in self._spawn_tools:
+            self._active_spawns.pop(tool_call_id, None)
+            if len(self._active_spawns) == 0:
                 self._stop_spinner()
             else:
                 self._start_or_update_spinner()
@@ -822,7 +861,7 @@ class StreamingUIHooks:
         #   - current "delegate":{"error": ..., "success": ..., "output": {"response": ...}}
         # Suppress only when a "response" is present (success shape); error-shaped
         # results (no "response" anywhere, strings, etc.) render so failures aren't hidden.
-        if tool_name in ("task", "delegate") and isinstance(result, dict):
+        if tool_name in self._spawn_tools and isinstance(result, dict):
             output = result.get("output")
             if "response" in result or (
                 isinstance(output, dict) and "response" in output
