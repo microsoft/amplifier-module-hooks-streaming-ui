@@ -265,11 +265,14 @@ async def test_empty_text_block_skipped(capsys):
 
 
 @pytest.mark.asyncio
-async def test_sub_agent_intermediate_text_suppressed(capsys):
-    """Sub-agent intermediate text (not last block) is SUPPRESSED.
+async def test_sub_agent_intermediate_text_painted(capsys):
+    """Sub-agent intermediate text (not last block) is NOW PAINTED attributed.
 
-    Changed in feat/subagent-curated (change 4): intermediate sub-agent asides
-    are no longer rendered — only the final result is shown, attributed.
+    Previously (curation commit 35fddbc / feat/subagent-curated change 4) this
+    test asserted suppression.  The regression has been restored: intermediate
+    asides render dim + attributed, same as the final block.  Streaming
+    (token-level) output remains suppressed via the overlay _on_delta pass —
+    this only fires at content_block:end once the block is fully settled.
     """
     hooks = _hooks()
     # Sub-agent session IDs contain an underscore followed by the agent name.
@@ -282,12 +285,16 @@ async def test_sub_agent_intermediate_text_suppressed(capsys):
     await hooks.handle_content_block_end("content_block:end", data)
 
     captured = capsys.readouterr()
-    # Intermediate sub-agent text must produce NO output (suppressed).
-    assert captured.out == "", (
-        f"Intermediate sub-agent text must be suppressed; got: {captured.out!r}"
+    output = captured.out
+    # Intermediate aside must now render with attribution.
+    assert "[foundation:explorer]" in output, (
+        f"Sub-agent intermediate aside must include attribution; got: {output!r}"
+    )
+    assert "Checking the module structure." in output, (
+        f"Sub-agent intermediate text must appear in output; got: {output!r}"
     )
     assert captured.err == "", (
-        f"No stderr for sub-agent intermediate text; got: {captured.err!r}"
+        f"No stderr expected for sub-agent intermediate text; got: {captured.err!r}"
     )
 
 

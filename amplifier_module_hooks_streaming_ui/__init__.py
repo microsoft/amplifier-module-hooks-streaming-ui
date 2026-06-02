@@ -601,11 +601,11 @@ class StreamingUIHooks:
         # here.  The FINAL text block (is_last_block=True) is skipped entirely — the
         # hook no longer owns it.
         #
-        # SUB-AGENT (agent_name is not None) — Change 4 (unchanged):
-        # Intermediate asides (not is_last_block) are SUPPRESSED.
-        # Final result (is_last_block) is painted ATTRIBUTED via
-        # _paint_interleaved_text, which renders a dim-cyan [agent_name] label
-        # above a full-width dimmed Markdown body (same layout as parent).
+        # SUB-AGENT (agent_name is not None):
+        # ALL settled text blocks (intermediate asides AND the final) are
+        # painted ATTRIBUTED via _paint_interleaved_text, which renders a
+        # dim-cyan [agent_name] label above a full-width dimmed Markdown body.
+        # Live token streaming stays suppressed (overlay _on_delta pass).
         if block_type == "text" and block.get("text", "").strip():
             text = block["text"]
             if agent_name is None:
@@ -631,11 +631,12 @@ class StreamingUIHooks:
                             dim=True,
                         )
             else:
-                # Sub-agent (change 4): suppress intermediate asides;
-                # render only the final result, attributed with agent name.
-                if is_last_block:
-                    self._paint_interleaved_text(text, agent_name)
-                # else: intermediate aside — suppressed
+                # Sub-agent: render ALL settled text blocks (intermediate asides
+                # AND the final), attributed + dimmed. Live token streaming stays
+                # suppressed (handled in the overlay _on_delta); this only paints
+                # COMPLETE blocks at content_block:end, so parallel sub-agents
+                # produce coherent (non-interleaved-at-token-level) output.
+                self._paint_interleaved_text(text, agent_name)
 
         # Display token usage after last block (if present and configured)
         if is_last_block and self.show_token_usage and usage:

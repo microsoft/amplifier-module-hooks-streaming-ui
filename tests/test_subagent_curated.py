@@ -287,11 +287,18 @@ class TestChange3ThinkingNotPainted:
 
 
 class TestChange4TextBlockRouting:
-    """Sub-agent text: intermediate suppressed, final attributed (change 4)."""
+    """Sub-agent text: ALL settled blocks painted attributed (intermediate + final)."""
 
     @pytest.mark.asyncio
-    async def test_intermediate_sub_agent_text_suppressed(self, capsys):
-        """Sub-agent text that is NOT the last block produces no output."""
+    async def test_intermediate_sub_agent_text_painted(self, capsys):
+        """Sub-agent text that is NOT the last block is now painted attributed.
+
+        Previously (curation commit 35fddbc) this asserted suppression.  The
+        regression has been restored: intermediate asides now render dim +
+        attributed just like the final block.  Streaming (token-level) output
+        remains suppressed via the overlay _on_delta pass — this only fires at
+        content_block:end once the block is fully settled.
+        """
         hooks = _hooks()
 
         result = await hooks.handle_content_block_end(
@@ -308,11 +315,19 @@ class TestChange4TextBlockRouting:
         assert result.action == "continue"
 
         captured = capsys.readouterr()
-        assert captured.out == "", (
-            f"Sub-agent intermediate text must be suppressed; got: {captured.out!r}"
+        output = captured.out
+
+        # Attribution header must appear (intermediate aside is now rendered)
+        assert f"[{_AGENT}]" in output, (
+            f"Sub-agent intermediate aside must include [{_AGENT}] attribution; "
+            f"got: {output!r}"
+        )
+        # The aside text itself must appear
+        assert "An intermediate aside." in output, (
+            f"Sub-agent intermediate text must appear in output; got: {output!r}"
         )
         assert captured.err == "", (
-            f"No stderr for intermediate sub-agent text; got: {captured.err!r}"
+            f"No stderr expected for intermediate sub-agent text; got: {captured.err!r}"
         )
 
     @pytest.mark.asyncio
