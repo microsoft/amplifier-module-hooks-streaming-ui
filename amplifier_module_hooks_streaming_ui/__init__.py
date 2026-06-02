@@ -8,11 +8,8 @@ __amplifier_module_type__ = "hook"
 
 import logging
 import math
-import os
 import re
-import signal
 import sys
-from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -22,7 +19,6 @@ from rich.live import Live
 from rich.markdown import Heading as _RichHeading
 from rich.markdown import Markdown as _RichMarkdown
 from rich.padding import Padding
-from rich.spinner import Spinner as _RichSpinner
 from rich.styled import Styled
 from rich.text import Text
 
@@ -82,6 +78,7 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     show_tool_lines = ui_config.get("show_tool_lines", 5)
     show_token_usage = ui_config.get("show_token_usage", True)
     stream_tokens = ui_config.get("stream_tokens", False)
+    spawn_tools = ui_config.get("spawn_tools", ["task", "delegate"])
 
     # Determine overlay state up front so the atomic renderer can skip
     # thinking re-paints that the overlay already owns.
@@ -90,7 +87,11 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
 
     # Create hook handlers
     hooks = StreamingUIHooks(
-        show_thinking, show_tool_lines, show_token_usage, overlay_active=overlay_active
+        show_thinking,
+        show_tool_lines,
+        show_token_usage,
+        overlay_active=overlay_active,
+        spawn_tools=spawn_tools,
     )
 
     # Register atomic handlers (existing — unchanged in v2)
@@ -207,6 +208,7 @@ class StreamingUIHooks:
         show_tool_lines: int,
         show_token_usage: bool,
         overlay_active: bool = False,
+        spawn_tools: tuple[str, ...] = ("task", "delegate"),
     ):
         """Initialize streaming UI hooks.
 
@@ -218,6 +220,10 @@ class StreamingUIHooks:
                 When True, the atomic renderer skips parent thinking re-paints
                 because the overlay already painted them permanently at block-end.
                 When False (default), the atomic renderer paints them as before.
+            spawn_tools: Tool names that spawn sub-agents.  Any tool whose name
+                appears in this tuple triggers per-agent list tracking.
+                Default: ("task", "delegate").  Configurable via
+                ``ui.spawn_tools`` in the mount config.
         """
         self.show_thinking = show_thinking
         self.show_tool_lines = show_tool_lines
@@ -238,72 +244,11 @@ class StreamingUIHooks:
         # to suppress the deferred duplicate render (Part 4 guard).
         # Keyed by session_id (str); values are sets of int block indices.
         self._overlay_painted_text: dict[str, set[int]] = {}
-        # Sub-agent spinner state.
-        # _subagents_running: counter incremented on delegate/task tool:pre,
-        # decremented on tool:post.  Count > 0 → ≥1 sub-agent is running.
-        # _spinner_live: singleton Rich Live; lazily created on first spawn.
-        # _spinner_console: dedicated stdout Console for the spinner.
-        # _is_tty: cached isatty() result; spinner only starts on TTY.
-        self._subagents_running: int = 0
-        self._spinner_live: Live | None = None
-        self._spinner_console: Console = Console(file=sys.stdout)
-        self._is_tty: bool = getattr(sys.stdout, "isatty", lambda: False)()
+        # _spawn_tools: names of tools that spawn sub-agents (config-driven).
+        # Used to gate the static per-spawn marker printed in handle_tool_pre.
+        self._spawn_tools: tuple[str, ...] = tuple(spawn_tools)
 
     # ── Formula helper ─────────────────────────────────────────────────────
-
-    def _make_spinner_renderable(self, n: int) -> _RichSpinner:
-        """Return a Spinner renderable labelled for *n* active sub-agents."""
-        label = f"\u23f3 {n} sub-agent{'s' if n != 1 else ''} working\u2026"
-        return _RichSpinner("dots", text=Text(label, style="dim"))
-
-    def _start_or_update_spinner(self) -> None:
-        """Start the spinner if not running, or update its text.
-
-        TTY-gated: no-op when stdout is not a TTY.
-        """
-        if not self._is_tty:
-            return
-        n = self._subagents_running
-        renderable = self._make_spinner_renderable(n)
-        if self._spinner_live is None:
-            self._spinner_live = Live(
-                renderable,
-                console=self._spinner_console,
-                transient=True,
-                refresh_per_second=12,
-            )
-        else:
-            self._spinner_live.update(renderable)
-        if not self._spinner_live.is_started:
-            self._spinner_live.start()
-
-    def _stop_spinner(self) -> None:
-        """Stop the spinner if it is currently running (transient clears it)."""
-        if self._spinner_live is not None and self._spinner_live.is_started:
-            self._spinner_live.stop()
-
-    @contextmanager
-    def _with_spinner_paused(self):  # type: ignore[return]
-        """Context manager: pause the spinner, do work, then resume.
-
-        While the spinner Live is active, plain print() / Console.print()
-        calls corrupt the live region.  This context manager temporarily stops
-        the spinner (transient clears it), lets the caller print safely, then
-        restarts it if the sub-agent counter is still >0.
-
-        Use for every sub-agent print (tool frames and final result).  Never
-        use for parent prints -- the parent never prints while count>0.
-        """
-        live = self._spinner_live
-        was_started = live is not None and live.is_started
-        if was_started and live is not None:
-            live.stop()
-        try:
-            yield
-        finally:
-            if was_started and self._subagents_running > 0 and live is not None:
-                live.update(self._make_spinner_renderable(self._subagents_running))
-                live.start()
 
     def _compute_total_input(self, usage: dict) -> int:
         """Compute gross total input tokens.
@@ -415,9 +360,9 @@ class StreamingUIHooks:
         ):
             self.thinking_blocks[block_index] = {"started": True, "agent": agent_name}
             if agent_name:
-                # Change 2: suppress sub-agent thinking-start status line.
-                # Parent path below is unchanged.
-                pass
+                # Sub-agent thinking: emit attributed marker.
+                sys.stderr.write(f"\n\033[36m🤔 [{agent_name}] Thinking...\033[0m\n")
+                sys.stderr.flush()
             else:
                 # Parent thinking: status line cyan.
                 # Skip when the overlay is active — the overlay already shows a
@@ -478,18 +423,16 @@ class StreamingUIHooks:
             # Sub-agent final result: full-width dimmed Markdown with a dim-cyan
             # [agent_name] label.  _text_renderable's leading Text("") provides
             # the blank-before; we add one trailing blank for separation.
-            # Spinner is paused so the live region is not corrupted by the print.
             out = Console(file=sys.stdout, highlight=False)
-            with self._with_spinner_paused():
-                out.print(
-                    _text_renderable(
-                        text,
-                        dim=True,
-                        label=f"[{agent_name}]",
-                        label_style="dim cyan",
-                    )
+            out.print(
+                _text_renderable(
+                    text,
+                    dim=True,
+                    label=f"[{agent_name}]",
+                    label_style="dim cyan",
                 )
-                print()  # Blank line after
+            )
+            print()  # Blank line after
 
     async def handle_content_block_end(
         self, _event: str, data: dict[str, Any]
@@ -533,9 +476,7 @@ class StreamingUIHooks:
             # The skip applies only to parent sessions (agent_name is None).
             overlay_owns_thinking = self.overlay_active and (agent_name is None)
 
-            # Change 3: paint thinking only for parent sessions.
-            # Sub-agent thinking is suppressed (no framed block).
-            if not overlay_owns_thinking and agent_name is None:
+            if not overlay_owns_thinking:
                 # Extract thinking text from block
                 thinking_text = (
                     block.get("thinking", "")
@@ -577,11 +518,11 @@ class StreamingUIHooks:
         # here.  The FINAL text block (is_last_block=True) is skipped entirely — the
         # hook no longer owns it.
         #
-        # SUB-AGENT (agent_name is not None) — Change 4 (unchanged):
-        # Intermediate asides (not is_last_block) are SUPPRESSED.
-        # Final result (is_last_block) is painted ATTRIBUTED via
-        # _paint_interleaved_text, which renders a dim-cyan [agent_name] label
-        # above a full-width dimmed Markdown body (same layout as parent).
+        # SUB-AGENT (agent_name is not None):
+        # ALL settled text blocks (intermediate asides AND the final) are
+        # painted ATTRIBUTED via _paint_interleaved_text, which renders a
+        # dim-cyan [agent_name] label above a full-width dimmed Markdown body.
+        # Live token streaming stays suppressed (overlay _on_delta pass).
         if block_type == "text" and block.get("text", "").strip():
             text = block["text"]
             if agent_name is None:
@@ -607,11 +548,12 @@ class StreamingUIHooks:
                             dim=True,
                         )
             else:
-                # Sub-agent (change 4): suppress intermediate asides;
-                # render only the final result, attributed with agent name.
-                if is_last_block:
-                    self._paint_interleaved_text(text, agent_name)
-                # else: intermediate aside — suppressed
+                # Sub-agent: render ALL settled text blocks (intermediate asides
+                # AND the final), attributed + dimmed. Live token streaming stays
+                # suppressed (handled in the overlay _on_delta); this only paints
+                # COMPLETE blocks at content_block:end, so parallel sub-agents
+                # produce coherent (non-interleaved-at-token-level) output.
+                self._paint_interleaved_text(text, agent_name)
 
         # Display token usage after last block (if present and configured)
         if is_last_block and self.show_token_usage and usage:
@@ -717,11 +659,6 @@ class StreamingUIHooks:
             └─ Input: ... | Output: ...
             💰 Turn: ... | Session: ... ← flushed here
         """
-        # Reset spinner state at turn end — safety net for any aborted/stale
-        # sub-agent runs that didn't decrement the counter cleanly via tool:post.
-        self._subagents_running = 0
-        self._stop_spinner()
-
         if self._deferred_usage is not None or self._deferred_cost is not None:
             print()  # blank line between response and usage/cost
             if self._deferred_usage is not None:
@@ -756,35 +693,30 @@ class StreamingUIHooks:
         input_str = self._format_for_display(tool_input)
         truncated = self._truncate_lines(input_str, self.show_tool_lines)
 
-        is_spawn = tool_name in ("task", "delegate")
+        is_spawn = tool_name in self._spawn_tools
 
         if agent_name:
-            # Sub-agent tool call: route through spinner-pause to avoid corrupting
-            # the live spinner region.  The print must happen BEFORE counter
-            # increment so the pause is a no-op when the spinner isn't running yet
-            # (first-ever sub-agent call within this agent's scope).
-            with self._with_spinner_paused():
-                print(
-                    f"\n    \033[36m┌─ 🔧 [{agent_name}] Using tool: {tool_name}\033[0m"
-                )
-                # Indent each line of arguments
-                for line in truncated.split("\n"):
-                    print(f"    \033[36m│\033[0m  \033[2m{line}\033[0m")
-            # For nested spawns: increment counter and update spinner AFTER print.
+            # Sub-agent tool call: direct print (no live panel to pause).
+            print(f"\n    \033[36m┌─ 🔧 [{agent_name}] Using tool: {tool_name}\033[0m")
+            # Indent each line of arguments
+            for line in truncated.split("\n"):
+                print(f"    \033[36m│\033[0m  \033[2m{line}\033[0m")
             if is_spawn:
-                self._subagents_running += 1
-                self._start_or_update_spinner()
+                agent_label = (
+                    (tool_input or {}).get("agent") or tool_name or "sub-agent"
+                )
+                print(f"\033[2m⏳ {agent_label} working…\033[0m")
         else:
-            # Parent tool call: parent never prints while count>0, so the spinner
-            # is NOT running yet on the first spawn.  Print first, then start it.
+            # Parent tool call.
             print(f"\n\033[36m🔧 Using tool: {tool_name}\033[0m")
             # Indent each line of arguments
             for line in truncated.split("\n"):
                 print(f"   \033[2m{line}\033[0m")
-            # For spawn tools: increment counter and start spinner AFTER printing.
             if is_spawn:
-                self._subagents_running += 1
-                self._start_or_update_spinner()
+                agent_label = (
+                    (tool_input or {}).get("agent") or tool_name or "sub-agent"
+                )
+                print(f"\033[2m⏳ {agent_label} working…\033[0m")
 
         return HookResult(action="continue")
 
@@ -803,31 +735,6 @@ class StreamingUIHooks:
         tool_name = data.get("tool_name", "unknown")
         result = data.get("tool_response", data.get("result", {}))
         session_id = data.get("session_id")
-
-        # Spinner counter: decrement for spawn tools BEFORE any early return so the
-        # counter is always balanced with handle_tool_pre regardless of result shape.
-        if tool_name in ("task", "delegate"):
-            self._subagents_running = max(0, self._subagents_running - 1)
-            if self._subagents_running == 0:
-                self._stop_spinner()
-            else:
-                self._start_or_update_spinner()
-
-        # Change 5: when the sub-agent spawn tool returns a successful sub-agent
-        # response, suppress the result body — change 4 already rendered the
-        # attributed final. The spawn tool is named "delegate" in current builds
-        # (and "task" in older ones), so match both. The success "response" lives
-        # at one of two nesting levels depending on build:
-        #   - legacy "task":     {"response": ..., "session_id": ...}
-        #   - current "delegate":{"error": ..., "success": ..., "output": {"response": ...}}
-        # Suppress only when a "response" is present (success shape); error-shaped
-        # results (no "response" anywhere, strings, etc.) render so failures aren't hidden.
-        if tool_name in ("task", "delegate") and isinstance(result, dict):
-            output = result.get("output")
-            if "response" in result or (
-                isinstance(output, dict) and "response" in output
-            ):
-                return HookResult(action="continue")
 
         # Detect if this is a sub-agent's tool result
         agent_name = self._parse_agent_from_session_id(session_id)
@@ -874,15 +781,13 @@ class StreamingUIHooks:
         icon = "✅" if success else "❌"
 
         if agent_name:
-            # Sub-agent tool result: route through spinner-pause to avoid corrupting
-            # the live spinner region.
-            with self._with_spinner_paused():
-                print(
-                    f"    \033[36m└─ {icon} [{agent_name}] Tool result: {tool_name}\033[0m"
-                )
-                # Indent each line of multi-line output
-                indented = "\n".join(f"       {line}" for line in truncated.split("\n"))
-                print(f"\033[2m{indented}\033[0m\n")
+            # Sub-agent tool result: direct print (no live panel to pause).
+            print(
+                f"    \033[36m└─ {icon} [{agent_name}] Tool result: {tool_name}\033[0m"
+            )
+            # Indent each line of multi-line output
+            indented = "\n".join(f"       {line}" for line in truncated.split("\n"))
+            print(f"\033[2m{indented}\033[0m\n")
         else:
             # Parent tool result: status line cyan
             print(f"\033[36m{icon} Tool result: {tool_name}\033[0m")
