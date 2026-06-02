@@ -123,17 +123,29 @@ class TestPaintInterleavedUniform:
         out = capsys.readouterr().out
         assert "▸" not in out
 
-    def test_sub_agent_still_uses_rail_glyph(self, capsys):
-        """Sub-agent path (agent_name set) must still use ▍ rail — unchanged."""
+    def test_sub_agent_uses_agent_label_not_rail(self, capsys):
+        """Sub-agent path (agent_name set) must use [agent_name] label, NOT ▍ rail.
+
+        After Change A (feat/subagent-fullwidth-and-spinner): sub-agent final result
+        renders as full-width dimmed Markdown with a dim-cyan [agent_name] label —
+        no rail, no 4-space indent, no 52-col wrap.
+        """
         hooks = _hooks()
         hooks._paint_interleaved_text("Checking structure.", "foundation:explorer")
         out = capsys.readouterr().out
-        assert "▍" in out, (
-            f"Sub-agent _paint_interleaved_text must still use ▍; got: {out!r}"
+        # Must have [agent_name] label
+        assert "[foundation:explorer]" in out, (
+            f"Sub-agent must have [foundation:explorer] label; got: {out!r}"
         )
+        # Must NOT use rail glyph
+        assert "▍" not in out, (
+            f"Sub-agent must NOT use ▍ rail glyph after Change A; got: {out!r}"
+        )
+        # Must contain the content
+        assert "Checking structure." in out
 
     def test_sub_agent_no_amplifier_label(self, capsys):
-        """Sub-agent path must NOT emit 'Amplifier:' — uses rail with agent name."""
+        """Sub-agent path must NOT emit 'Amplifier:' — uses [agent_name] label."""
         hooks = _hooks()
         hooks._paint_interleaved_text("some detail", "foundation:explorer")
         out = capsys.readouterr().out

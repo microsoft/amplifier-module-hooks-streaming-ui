@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import sys
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -21,6 +22,7 @@ from rich.live import Live
 from rich.markdown import Heading as _RichHeading
 from rich.markdown import Markdown as _RichMarkdown
 from rich.padding import Padding
+from rich.spinner import Spinner as _RichSpinner
 from rich.styled import Styled
 from rich.text import Text
 
@@ -236,8 +238,72 @@ class StreamingUIHooks:
         # to suppress the deferred duplicate render (Part 4 guard).
         # Keyed by session_id (str); values are sets of int block indices.
         self._overlay_painted_text: dict[str, set[int]] = {}
+        # Sub-agent spinner state.
+        # _subagents_running: counter incremented on delegate/task tool:pre,
+        # decremented on tool:post.  Count > 0 → ≥1 sub-agent is running.
+        # _spinner_live: singleton Rich Live; lazily created on first spawn.
+        # _spinner_console: dedicated stdout Console for the spinner.
+        # _is_tty: cached isatty() result; spinner only starts on TTY.
+        self._subagents_running: int = 0
+        self._spinner_live: Live | None = None
+        self._spinner_console: Console = Console(file=sys.stdout)
+        self._is_tty: bool = getattr(sys.stdout, "isatty", lambda: False)()
 
     # ── Formula helper ─────────────────────────────────────────────────────
+
+    def _make_spinner_renderable(self, n: int) -> _RichSpinner:
+        """Return a Spinner renderable labelled for *n* active sub-agents."""
+        label = f"\u23f3 {n} sub-agent{'s' if n != 1 else ''} working\u2026"
+        return _RichSpinner("dots", text=Text(label, style="dim"))
+
+    def _start_or_update_spinner(self) -> None:
+        """Start the spinner if not running, or update its text.
+
+        TTY-gated: no-op when stdout is not a TTY.
+        """
+        if not self._is_tty:
+            return
+        n = self._subagents_running
+        renderable = self._make_spinner_renderable(n)
+        if self._spinner_live is None:
+            self._spinner_live = Live(
+                renderable,
+                console=self._spinner_console,
+                transient=True,
+                refresh_per_second=12,
+            )
+        else:
+            self._spinner_live.update(renderable)
+        if not self._spinner_live.is_started:
+            self._spinner_live.start()
+
+    def _stop_spinner(self) -> None:
+        """Stop the spinner if it is currently running (transient clears it)."""
+        if self._spinner_live is not None and self._spinner_live.is_started:
+            self._spinner_live.stop()
+
+    @contextmanager
+    def _with_spinner_paused(self):  # type: ignore[return]
+        """Context manager: pause the spinner, do work, then resume.
+
+        While the spinner Live is active, plain print() / Console.print()
+        calls corrupt the live region.  This context manager temporarily stops
+        the spinner (transient clears it), lets the caller print safely, then
+        restarts it if the sub-agent counter is still >0.
+
+        Use for every sub-agent print (tool frames and final result).  Never
+        use for parent prints -- the parent never prints while count>0.
+        """
+        live = self._spinner_live
+        was_started = live is not None and live.is_started
+        if was_started and live is not None:
+            live.stop()
+        try:
+            yield
+        finally:
+            if was_started and self._subagents_running > 0 and live is not None:
+                live.update(self._make_spinner_renderable(self._subagents_running))
+                live.start()
 
     def _compute_total_input(self, usage: dict) -> int:
         """Compute gross total input tokens.
@@ -385,14 +451,15 @@ class StreamingUIHooks:
         line (``Text("")``); do NOT add a second leading blank.  One trailing
         blank line is added for separation.
 
-        Sub-agent (agent_name is not None): unchanged rail rendering via
-        ``_rail_renderable`` — ``▍`` on every line, ANSI-256 colors 103/145,
-        wrap_width=52, 4-space indent.
+        Sub-agent (agent_name is not None): full-width dimmed Markdown identical
+        to the parent renderable, but with a dim-cyan ``[agent_name]`` label
+        instead of ``Amplifier:``.  The spinner (if active) is paused around the
+        print so the live region is not corrupted.
 
         Args:
             text:       The interleaved text to render.  Must be non-empty;
                         callers are responsible for the strip() guard.
-            agent_name: Agent name for sub-agent indentation, or None for parent.
+            agent_name: Agent name for sub-agent attribution, or None for parent.
         """
         if agent_name is None:
             # Parent: uniform renderable identical to the streaming Live preview.
@@ -408,14 +475,21 @@ class StreamingUIHooks:
                 # placeholder has no leading blank of its own.
                 print()
         else:
-            # Sub-agent final result: attributed header + rail body (change 4).
-            # A dim-cyan [agent_name] header precedes the rail so parallel-agent
-            # readers can tell whose result it is.
-            print()  # Blank line before
-            out_console = Console(file=sys.stdout, highlight=False)
-            out_console.print(Text(f"[{agent_name}]", style="dim cyan"))
-            out_console.print(_rail_renderable(text, agent_name))
-            print()  # Blank line after
+            # Sub-agent final result: full-width dimmed Markdown with a dim-cyan
+            # [agent_name] label.  _text_renderable's leading Text("") provides
+            # the blank-before; we add one trailing blank for separation.
+            # Spinner is paused so the live region is not corrupted by the print.
+            out = Console(file=sys.stdout, highlight=False)
+            with self._with_spinner_paused():
+                out.print(
+                    _text_renderable(
+                        text,
+                        dim=True,
+                        label=f"[{agent_name}]",
+                        label_style="dim cyan",
+                    )
+                )
+                print()  # Blank line after
 
     async def handle_content_block_end(
         self, _event: str, data: dict[str, Any]
@@ -643,6 +717,11 @@ class StreamingUIHooks:
             └─ Input: ... | Output: ...
             💰 Turn: ... | Session: ... ← flushed here
         """
+        # Reset spinner state at turn end — safety net for any aborted/stale
+        # sub-agent runs that didn't decrement the counter cleanly via tool:post.
+        self._subagents_running = 0
+        self._stop_spinner()
+
         if self._deferred_usage is not None or self._deferred_cost is not None:
             print()  # blank line between response and usage/cost
             if self._deferred_usage is not None:
@@ -677,18 +756,35 @@ class StreamingUIHooks:
         input_str = self._format_for_display(tool_input)
         truncated = self._truncate_lines(input_str, self.show_tool_lines)
 
+        is_spawn = tool_name in ("task", "delegate")
+
         if agent_name:
-            # Sub-agent tool call: status line cyan, 4-space indent, box drawing
-            print(f"\n    \033[36m┌─ 🔧 [{agent_name}] Using tool: {tool_name}\033[0m")
-            # Indent each line of arguments
-            for line in truncated.split("\n"):
-                print(f"    \033[36m│\033[0m  \033[2m{line}\033[0m")
+            # Sub-agent tool call: route through spinner-pause to avoid corrupting
+            # the live spinner region.  The print must happen BEFORE counter
+            # increment so the pause is a no-op when the spinner isn't running yet
+            # (first-ever sub-agent call within this agent's scope).
+            with self._with_spinner_paused():
+                print(
+                    f"\n    \033[36m┌─ 🔧 [{agent_name}] Using tool: {tool_name}\033[0m"
+                )
+                # Indent each line of arguments
+                for line in truncated.split("\n"):
+                    print(f"    \033[36m│\033[0m  \033[2m{line}\033[0m")
+            # For nested spawns: increment counter and update spinner AFTER print.
+            if is_spawn:
+                self._subagents_running += 1
+                self._start_or_update_spinner()
         else:
-            # Parent tool call: status line cyan
+            # Parent tool call: parent never prints while count>0, so the spinner
+            # is NOT running yet on the first spawn.  Print first, then start it.
             print(f"\n\033[36m🔧 Using tool: {tool_name}\033[0m")
             # Indent each line of arguments
             for line in truncated.split("\n"):
                 print(f"   \033[2m{line}\033[0m")
+            # For spawn tools: increment counter and start spinner AFTER printing.
+            if is_spawn:
+                self._subagents_running += 1
+                self._start_or_update_spinner()
 
         return HookResult(action="continue")
 
@@ -707,6 +803,15 @@ class StreamingUIHooks:
         tool_name = data.get("tool_name", "unknown")
         result = data.get("tool_response", data.get("result", {}))
         session_id = data.get("session_id")
+
+        # Spinner counter: decrement for spawn tools BEFORE any early return so the
+        # counter is always balanced with handle_tool_pre regardless of result shape.
+        if tool_name in ("task", "delegate"):
+            self._subagents_running = max(0, self._subagents_running - 1)
+            if self._subagents_running == 0:
+                self._stop_spinner()
+            else:
+                self._start_or_update_spinner()
 
         # Change 5: when the sub-agent spawn tool returns a successful sub-agent
         # response, suppress the result body — change 4 already rendered the
@@ -769,13 +874,15 @@ class StreamingUIHooks:
         icon = "✅" if success else "❌"
 
         if agent_name:
-            # Sub-agent tool result: status line cyan, 4-space indent, box drawing
-            print(
-                f"    \033[36m└─ {icon} [{agent_name}] Tool result: {tool_name}\033[0m"
-            )
-            # Indent each line of multi-line output
-            indented = "\n".join(f"       {line}" for line in truncated.split("\n"))
-            print(f"\033[2m{indented}\033[0m\n")
+            # Sub-agent tool result: route through spinner-pause to avoid corrupting
+            # the live spinner region.
+            with self._with_spinner_paused():
+                print(
+                    f"    \033[36m└─ {icon} [{agent_name}] Tool result: {tool_name}\033[0m"
+                )
+                # Indent each line of multi-line output
+                indented = "\n".join(f"       {line}" for line in truncated.split("\n"))
+                print(f"\033[2m{indented}\033[0m\n")
         else:
             # Parent tool result: status line cyan
             print(f"\033[36m{icon} Tool result: {tool_name}\033[0m")
@@ -1240,55 +1347,29 @@ def _thinking_renderable(
     )
 
 
-def _rail_renderable(content: str, agent_name: str | None = None) -> Any:
-    """Return a Rich renderable for a rail-style interleaved aside.
+def _text_renderable(
+    content: str,
+    *,
+    dim: bool = False,
+    label: str = "Amplifier:",
+    label_style: str | None = None,
+) -> Any:
+    """Return a Rich renderable for a streaming text block.
 
-    Renders as: one Rich ``Text`` row per rendered line, each prefixed with
-    ``▍`` in ``color(103)`` and the line text in ``color(145)``.  Suitable
-    for both ``_paint_interleaved_text`` (settled output) and
-    ``_text_renderable`` (streaming preview), so both paths produce identical
-    rail output — just as ``_thinking_renderable`` is shared between the
-    thinking-block Live preview and the final atomic render.
+    Renders as: a blank separator line, a label line, then full-width
+    ``Markdown(content)`` as the body.
 
-    Args:
-        content:    The aside text (Markdown).  Empty / whitespace-only
-                    content returns an empty ``Group`` with no output.
-        agent_name: When set, adds a 4-space indent before the ``▍`` glyph
-                    and wraps at width 52; parent (``None``) uses width 60
-                    with no indent.
+    Default behaviour (parent path — ``label="Amplifier:"`` unchanged):
+      - ``label_style`` defaults to ``"dim green"`` when ``dim=True`` and
+        ``"bold green"`` otherwise.
+      - Every parent call site passes no new arguments, so parent output is
+        byte-identical to before.
 
-    Returns:
-        A Rich renderable (``Group``) suitable for ``Live.update()`` or
-        ``console.print()``.
-    """
-    from io import StringIO
+    Sub-agent path (``label="[agent_name]"``, ``label_style="dim cyan"``):
+      - Produces full-width dimmed Markdown with the dim-cyan agent label,
+        matching the parent's layout but with distinct styling.
 
-    if not content.strip():
-        return Group()
-
-    indent = "    " if agent_name else ""
-    wrap_width = 52 if agent_name else 60
-
-    buf = StringIO()
-    Console(file=buf, highlight=False, width=wrap_width).print(Markdown(content))
-    lines = buf.getvalue().rstrip("\n").split("\n")
-
-    rows = []
-    for line in lines:
-        row = Text(indent)
-        row.append("▍ ", style="color(103)")
-        row.append(line, style="color(145)")
-        rows.append(row)
-
-    return Group(*rows)
-
-
-def _text_renderable(content: str, *, dim: bool = False) -> Any:
-    """Return a Rich renderable for a streaming parent *text* block.
-
-    Renders as: a blank separator line, a bold-green ``Amplifier:`` label,
-    then full-width ``Markdown(content)`` as the body.  This is the **single
-    uniform renderable** used for:
+    This is the **single uniform renderable** used for:
 
       - streaming preview: ``Live.update(_text_renderable(tail))`` during
         token streaming (transient — clears when block ends).
@@ -1296,6 +1377,8 @@ def _text_renderable(content: str, *, dim: bool = False) -> Any:
         sessions, which calls ``Console.print(_text_renderable(text))``.
       - final response: painted by app-cli's ``render_message`` (sole owner,
         #256 fix); the hook no longer settle-paints the final text block.
+      - sub-agent final result: ``_paint_interleaved_text`` with
+        ``label="[agent_name]"`` and ``label_style="dim cyan"``.
 
     Because the streaming preview and settled asides all use this same
     renderable, there is NO snap at settle time — the output is byte-identical.
@@ -1311,6 +1394,8 @@ def _text_renderable(content: str, *, dim: bool = False) -> Any:
     body uses the full console width, which ``_fit_tail_to_height`` measures
     accurately via ``console.render_lines`` — no budget change needed.
     """
+    if label_style is None:
+        label_style = "dim green" if dim else "bold green"
     body: Any = Markdown(content)
     if dim:
         # Settled interleaved asides are dimmed so they don't compete with the
@@ -1323,7 +1408,7 @@ def _text_renderable(content: str, *, dim: bool = False) -> Any:
         body = Styled(body, "dim")
     return Group(
         Text(""),
-        Text("Amplifier:", style="dim green" if dim else "bold green"),
+        Text(label, style=label_style),
         body,
     )
 
