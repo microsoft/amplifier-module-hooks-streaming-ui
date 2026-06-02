@@ -629,8 +629,13 @@ class TestParentPathUnchanged:
     """Verify key parent-path invariants still hold after curated changes."""
 
     @pytest.mark.asyncio
-    async def test_parent_final_text_rendered(self, capsys):
-        """Parent final text still renders with Amplifier: label (regression guard)."""
+    async def test_parent_final_text_NOT_rendered_by_hook(self, capsys):
+        """Parent final text is NOT painted by the hook (#256 fix; regression guard).
+
+        Changed in fix/256-hook-skip-final: handle_content_block_end skips
+        is_last_block=True for parent (agent_name=None) sessions. app-cli's
+        render_message is the sole owner. Old test asserted the opposite.
+        """
         hooks = _hooks()
 
         await hooks.handle_content_block_end(
@@ -644,8 +649,10 @@ class TestParentPathUnchanged:
         )
 
         captured = capsys.readouterr()
-        assert "Amplifier:" in captured.out
-        assert "Parent response text." in captured.out
+        # Hook must NOT paint the final parent text (#256 double-render fix)
+        assert "Parent response text." not in captured.out, (
+            f"Hook must skip parent final text; got: {captured.out!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_parent_thinking_painted_with_frame(self, capsys):

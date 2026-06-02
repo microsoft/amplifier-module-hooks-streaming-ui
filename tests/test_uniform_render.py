@@ -1,17 +1,19 @@
 """TDD tests for uniform Amplifier:+Markdown rendering for all parent text.
 
-These tests assert the NEW behaviour introduced in feat/uniform-assistant-render:
+These tests assert the behaviour introduced in feat/uniform-assistant-render
+AND updated in fix/256-hook-skip-final:
 
   1. _text_renderable: body is full-width Markdown (no ▍ rail glyph).
   2. _paint_interleaved_text parent (agent_name=None): output has "Amplifier:"
-     + markdown text, NO ▍.  Sub-agent path still uses ▍ (unchanged).
+     + markdown text, NO ▍.  Sub-agent path still uses [agent_name] label (unchanged).
   3. handle_content_block_end: FINAL text block (is_last_block=True, parent,
-     not in _overlay_painted_text) is now painted by the hook via
-     _paint_interleaved_text → _text_renderable.
+     not in _overlay_painted_text) is NOT painted by the hook (#256 fix).
+     app-cli's render_message is the sole owner. Interleaved asides are still painted.
   4. Overlay-painted interleaved aside (index in _overlay_painted_text) is
      still skipped by handle_content_block_end (de-dup guard unchanged).
 
-All tests in this file FAIL before implementation and PASS after.
+Section 3 (TestFinalBlockNotPaintedByHook, formerly TestFinalBlockPaintedByHook)
+was inverted in fix/256-hook-skip-final to encode the new single-owner contract.
 """
 
 from __future__ import annotations
@@ -159,16 +161,32 @@ class TestPaintInterleavedUniform:
 
 
 # ---------------------------------------------------------------------------
-# 3. handle_content_block_end — final block now painted by hook
+# 3. handle_content_block_end — final block NOT painted by hook (#256)
+# ---------------------------------------------------------------------------
+#
+# Changed in fix/256-hook-skip-final: the hook no longer paints the parent final
+# response. app-cli's render_message is the single owner (single-owner pattern;
+# avoids the #256 double-render).  The old "TestFinalBlockPaintedByHook" class
+# encoded the now-reversed old-#22 behavior.
 # ---------------------------------------------------------------------------
 
 
-class TestFinalBlockPaintedByHook:
-    """handle_content_block_end must now paint the FINAL text block."""
+class TestFinalBlockNotPaintedByHook:
+    """handle_content_block_end must NOT paint the FINAL parent text block (#256).
+
+    app-cli's render_message is the sole owner. The hook paints interleaved
+    ASIDES only; it skips is_last_block=True for parent (agent_name=None) sessions.
+    Both overlay_active=False and overlay_active=True paths must skip.
+    (Previously named TestFinalBlockPaintedByHook -- behavior inverted by #256 fix.)
+    """
 
     @pytest.mark.asyncio
-    async def test_final_text_block_is_painted(self, capsys):
-        """block_index=0, total_blocks=1 (final, only block) MUST now be painted."""
+    async def test_final_text_block_is_NOT_painted(self, capsys):
+        """block_index=0, total_blocks=1 (final, only block) must NOT be painted.
+
+        Changed in fix/256-hook-skip-final: hook skips is_last_block for parent.
+        Old test asserted the opposite (test_final_text_block_is_painted).
+        """
         hooks = _hooks()
         data = {
             "block_index": 0,
@@ -181,28 +199,28 @@ class TestFinalBlockPaintedByHook:
         assert result.action == "continue"
 
         out = capsys.readouterr().out
-        assert "Final answer here." in out, (
-            f"Final text block must be painted by hook; got: {out!r}"
-        )
-        assert "Amplifier:" in out, (
-            f"Final text block must contain 'Amplifier:' label; got: {out!r}"
-        )
-        assert "▍" not in out, (
-            f"Final text block must use Markdown body (no ▍); got: {out!r}"
+        assert "Final answer here." not in out, (
+            f"Hook must NOT paint the final text block (#256); got: {out!r}"
         )
 
     @pytest.mark.asyncio
-    async def test_final_block_has_no_rail_glyph(self, capsys):
-        """Final block paint must use _text_renderable (Markdown), not rail."""
-        hooks = _hooks()
+    async def test_final_text_block_not_painted_overlay_active(self, capsys):
+        """Same skip when overlay_active=True (both overlay paths must skip final)."""
+        hooks = _hooks(overlay_active=True)
         data = {
             "block_index": 0,
             "total_blocks": 1,
-            "block": {"type": "text", "text": "The conclusion."},
+            "block": {"type": "text", "text": "Final overlay answer."},
         }
-        await hooks.handle_content_block_end("content_block:end", data)
+        result = await hooks.handle_content_block_end("content_block:end", data)
+
+        assert isinstance(result, HookResult)
+        assert result.action == "continue"
+
         out = capsys.readouterr().out
-        assert "▍" not in out
+        assert "Final overlay answer." not in out, (
+            f"Hook must skip parent final when overlay_active=True; got: {out!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_intermediate_block_is_painted(self, capsys):
