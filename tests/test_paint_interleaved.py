@@ -74,38 +74,44 @@ class TestPaintInterleavedText:
         assert "▸" not in out, "Whisper glyph ▸ should not appear"
         assert "Amplifier:" in out
 
-    def test_sub_agent_uses_4_space_indent(self, capsys):
-        """Sub-agent path (agent_name set) should indent with 4 spaces."""
+    def test_sub_agent_has_agent_label(self, capsys):
+        """Sub-agent path (agent_name set) uses [agent_name] label, not rail ▍."""
         hooks = _hooks()
         hooks._paint_interleaved_text("Checking structure.", "foundation:explorer")
         out = capsys.readouterr().out
-        # The 4-space indent must appear on lines with ▍
-        glyph_lines = [ln for ln in out.split("\n") if "▍" in ln]
-        assert glyph_lines, "No ▍ lines found in sub-agent output"
-        assert any("    " in ln for ln in glyph_lines), (
-            f"Expected 4-space indent for sub-agent; got: {out!r}"
+        # Label must appear
+        assert "[foundation:explorer]" in out, (
+            f"Expected '[foundation:explorer]' in sub-agent output; got: {out!r}"
         )
         assert "Checking structure." in out
+        # No rail glyph — full-width Markdown now
+        assert "▍" not in out, (
+            f"Sub-agent must NOT use ▍ rail glyph (now uses full-width Markdown); got: {out!r}"
+        )
 
-    def test_sub_agent_uses_wrap_width_52(self, capsys):
-        """Sub-agent path wraps at width 52; parent wraps at full console width.
+    def test_sub_agent_full_width_no_rail(self, capsys):
+        """Sub-agent path uses full-width Markdown (no ▍, no 4-space indent).
 
-        A line of 56 characters should wrap for sub-agent (52) but fits in parent
-        full-width.  We verify that sub-agent output has the ▍ glyph and
-        both contain the text content.
+        After Change A, sub-agent final renders via _text_renderable with
+        label='[agent_name]' — same layout as parent (full-width Markdown),
+        different label and style (dim cyan vs bold green).
         """
         hooks = _hooks()
-        # 56 characters — wraps at 52 (sub-agent) but fits at 60 (parent)
-        text = "A" * 56  # single long token-free line
+        text = "A" * 56  # 56 characters
         hooks._paint_interleaved_text(text, None)
         parent_out = capsys.readouterr().out
 
         hooks._paint_interleaved_text(text, "some-agent")
         subagent_out = capsys.readouterr().out
 
-        # Sub-agent output should be indented with ▍
-        assert "▍" in subagent_out, "Sub-agent must use ▍"
-        assert "    " in subagent_out
+        # Sub-agent output must NOT use ▍ rail glyph
+        assert "▍" not in subagent_out, (
+            f"Sub-agent must not use ▍ after Change A; got: {subagent_out!r}"
+        )
+        # Sub-agent output must contain [agent_name] label
+        assert "[some-agent]" in subagent_out, (
+            f"Sub-agent must have [some-agent] label; got: {subagent_out!r}"
+        )
         # Both should contain the text content
         assert "A" * 10 in parent_out
         assert "A" * 10 in subagent_out

@@ -260,7 +260,7 @@ async def test_empty_text_block_skipped(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Sub-agent indentation (unchanged — still uses ▍ rail)
+# Sub-agent rendering (Change A: full-width dimmed Markdown with [agent] label)
 # ---------------------------------------------------------------------------
 
 
@@ -270,8 +270,6 @@ async def test_sub_agent_intermediate_text_suppressed(capsys):
 
     Changed in feat/subagent-curated (change 4): intermediate sub-agent asides
     are no longer rendered — only the final result is shown, attributed.
-    The old test 'test_sub_agent_text_indented' asserted the opposite (painted);
-    updated to the new curated model.
     """
     hooks = _hooks()
     # Sub-agent session IDs contain an underscore followed by the agent name.
@@ -297,8 +295,9 @@ async def test_sub_agent_intermediate_text_suppressed(capsys):
 async def test_sub_agent_final_text_attributed(capsys):
     """Sub-agent FINAL text (last block) is rendered with [agent_name] attribution.
 
-    feat/subagent-curated change 4: when is_last_block=True, the sub-agent result
-    is painted with a dim-cyan [agent_name] header followed by the rail body.
+    feat/subagent-fullwidth-and-spinner (Change A): when is_last_block=True,
+    the sub-agent result is painted with a dim-cyan [agent_name] label above
+    full-width dimmed Markdown — no ▍ rail, no 4-space indent.
     """
     hooks = _hooks()
     # block_index=0, total_blocks=1 → is_last_block=True
