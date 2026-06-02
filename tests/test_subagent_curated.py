@@ -1,21 +1,18 @@
-"""Tests for curated sub-agent output (feat/subagent-curated).
+"""Tests for sub-agent rendering behavior.
 
-Covers all 5 changes:
-  Change 1: sub-agent overlay deltas produce NO stderr output.
-  Change 2: sub-agent thinking-start (content_block:start) produces NO stderr.
-  Change 3: sub-agent thinking block NOT painted at content_block:end.
-  Change 4a: sub-agent intermediate text (is_last_block=False) suppressed.
-  Change 4b: sub-agent final text (is_last_block=True) painted attributed.
-  Change 5a: task tool with {"response":…} result body suppressed.
-  Change 5b: task tool with error-shaped result rendered normally.
-  Change 5c: non-task tool result rendered normally.
+Restored behavior (reverted curation, except Change 1 live-token-stream suppression):
+  Change 1 (KEPT):  sub-agent overlay deltas produce NO stderr output (streaming OFF).
+  Change 2 (reverted): sub-agent thinking-start emits 🤔 [agent] Thinking... to stderr.
+  Change 3 (reverted): sub-agent thinking block IS painted at content_block:end.
+  Change 4a (unchanged): sub-agent intermediate text painted attributed.
+  Change 4b (unchanged): sub-agent final text painted attributed.
+  Change 5 (reverted): spawn-tool result envelope IS rendered (dedup removed).
 
 Parent-session behaviour is verified by the pre-existing test suite.
 """
 
 from __future__ import annotations
 
-import io
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,12 +40,12 @@ _PARENT_SID = "12345678-1234-1234-1234-123456789012"
 
 
 # ===========================================================================
-# Change 1: overlay _on_delta — sub-agent produces no stderr
+# Change 1 (KEPT): overlay _on_delta — sub-agent produces no stderr
 # ===========================================================================
 
 
 class TestChange1OverlayDeltaSuppressed:
-    """Sub-agent deltas write nothing to stderr (change 1)."""
+    """Sub-agent deltas write nothing to stderr (change 1 — KEPT)."""
 
     @pytest.mark.asyncio
     async def test_sub_agent_delta_no_stderr(self, capsys):
@@ -156,16 +153,16 @@ class TestChange1OverlayDeltaSuppressed:
 
 
 # ===========================================================================
-# Change 2: handle_content_block_start — sub-agent thinking no stderr
+# Change 2 (REVERTED): handle_content_block_start — sub-agent thinking emits marker
 # ===========================================================================
 
 
-class TestChange2ThinkingStartSuppressed:
-    """Sub-agent thinking-start writes nothing to stderr (change 2)."""
+class TestSubAgentThinkingStart:
+    """Sub-agent thinking-start now emits 🤔 [agent] Thinking... to stderr (reverted)."""
 
     @pytest.mark.asyncio
-    async def test_sub_agent_thinking_start_no_stderr(self, capsys):
-        """content_block:start for sub-agent thinking block → no stderr output."""
+    async def test_sub_agent_thinking_start_emits_marker(self, capsys):
+        """content_block:start for sub-agent thinking block → emits attributed marker."""
         hooks = _hooks()
 
         result = await hooks.handle_content_block_start(
@@ -182,14 +179,31 @@ class TestChange2ThinkingStartSuppressed:
         assert 0 in hooks.thinking_blocks  # tracking still happens
 
         captured = capsys.readouterr()
-        assert captured.err == "", (
-            f"Sub-agent thinking-start must write nothing to stderr; "
+        assert f"[{_AGENT}] Thinking..." in captured.err, (
+            f"Sub-agent thinking-start must emit attributed marker to stderr; "
             f"got: {captured.err!r}"
         )
 
     @pytest.mark.asyncio
+    async def test_sub_agent_thinking_marker_contains_agent_name(self, capsys):
+        """The thinking marker must include the agent name in brackets."""
+        hooks = _hooks()
+        await hooks.handle_content_block_start(
+            "content_block:start",
+            {
+                "block_type": "thinking",
+                "block_index": 0,
+                "session_id": "span_my-agent",
+            },
+        )
+        captured = capsys.readouterr()
+        assert "[my-agent] Thinking..." in captured.err, (
+            f"Marker must include agent name; got: {captured.err!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_parent_thinking_start_still_writes_stderr(self, capsys):
-        """Parent thinking-start still writes 🧠 Thinking... to stderr (regression guard)."""
+        """Parent thinking-start still writes 🤔 Thinking... to stderr (regression guard)."""
         hooks = _hooks()
 
         await hooks.handle_content_block_start(
@@ -209,16 +223,16 @@ class TestChange2ThinkingStartSuppressed:
 
 
 # ===========================================================================
-# Change 3: handle_content_block_end — sub-agent thinking not painted
+# Change 3 (REVERTED): handle_content_block_end — sub-agent thinking IS painted
 # ===========================================================================
 
 
-class TestChange3ThinkingNotPainted:
-    """Sub-agent thinking block is NOT painted at block-end (change 3)."""
+class TestSubAgentThinkingPainted:
+    """Sub-agent thinking block IS painted as a framed block at block-end (reverted)."""
 
     @pytest.mark.asyncio
-    async def test_sub_agent_thinking_not_painted(self, capsys):
-        """content_block:end for sub-agent thinking block must NOT paint framed block."""
+    async def test_sub_agent_thinking_is_painted(self, capsys):
+        """content_block:end for sub-agent thinking block MUST paint the framed block."""
         hooks = _hooks()
         hooks.thinking_blocks[0] = {"started": True, "agent": _AGENT}
 
@@ -240,19 +254,44 @@ class TestChange3ThinkingNotPainted:
 
         # Cleanup must still happen
         assert 0 not in hooks.thinking_blocks, (
-            "thinking_blocks entry must be cleaned up even when paint is suppressed"
+            "thinking_blocks entry must be cleaned up after paint"
         )
 
         captured = capsys.readouterr()
-        # Framed thinking block must NOT appear
-        assert "===" not in captured.out, (
-            f"Sub-agent thinking must NOT produce framed === block; got: {captured.out!r}"
+        # Framed thinking block MUST appear
+        assert "===" in captured.out, (
+            f"Sub-agent thinking MUST produce framed === block; got: {captured.out!r}"
         )
-        assert "Thinking:" not in captured.out, (
-            f"Sub-agent thinking must NOT produce 'Thinking:' header; got: {captured.out!r}"
+        assert "Thinking:" in captured.out, (
+            f"Sub-agent thinking MUST produce 'Thinking:' header; got: {captured.out!r}"
         )
-        assert "I am reasoning about this problem." not in captured.out, (
-            "Sub-agent thinking text must not appear in stdout"
+        assert "I am reasoning about this problem." in captured.out, (
+            "Sub-agent thinking text must appear in stdout"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_thinking_attributed(self, capsys):
+        """Sub-agent thinking block must include [agent_name] in the header."""
+        hooks = _hooks()
+        hooks.thinking_blocks[0] = {"started": True, "agent": _AGENT}
+
+        await hooks.handle_content_block_end(
+            "content_block:end",
+            {
+                "block_index": 0,
+                "total_blocks": 1,
+                "block": {
+                    "type": "thinking",
+                    "thinking": "Attribution check.",
+                },
+                "session_id": _SUB_SID,
+            },
+        )
+
+        captured = capsys.readouterr()
+        # The header should show "[foundation:explorer] Thinking:" or similar
+        assert _AGENT in captured.out, (
+            f"Sub-agent thinking block must include agent name; got: {captured.out!r}"
         )
 
     @pytest.mark.asyncio
@@ -282,7 +321,7 @@ class TestChange3ThinkingNotPainted:
 
 
 # ===========================================================================
-# Change 4: handle_content_block_end — text block routing
+# Change 4: handle_content_block_end — text block routing (unchanged)
 # ===========================================================================
 
 
@@ -291,14 +330,7 @@ class TestChange4TextBlockRouting:
 
     @pytest.mark.asyncio
     async def test_intermediate_sub_agent_text_painted(self, capsys):
-        """Sub-agent text that is NOT the last block is now painted attributed.
-
-        Previously (curation commit 35fddbc) this asserted suppression.  The
-        regression has been restored: intermediate asides now render dim +
-        attributed just like the final block.  Streaming (token-level) output
-        remains suppressed via the overlay _on_delta pass — this only fires at
-        content_block:end once the block is fully settled.
-        """
+        """Sub-agent intermediate text is painted attributed (not suppressed)."""
         hooks = _hooks()
 
         result = await hooks.handle_content_block_end(
@@ -317,17 +349,12 @@ class TestChange4TextBlockRouting:
         captured = capsys.readouterr()
         output = captured.out
 
-        # Attribution header must appear (intermediate aside is now rendered)
         assert f"[{_AGENT}]" in output, (
             f"Sub-agent intermediate aside must include [{_AGENT}] attribution; "
             f"got: {output!r}"
         )
-        # The aside text itself must appear
         assert "An intermediate aside." in output, (
             f"Sub-agent intermediate text must appear in output; got: {output!r}"
-        )
-        assert captured.err == "", (
-            f"No stderr expected for intermediate sub-agent text; got: {captured.err!r}"
         )
 
     @pytest.mark.asyncio
@@ -339,7 +366,7 @@ class TestChange4TextBlockRouting:
             "content_block:end",
             {
                 "block_index": 0,
-                "total_blocks": 1,  # is_last_block = 0==0 → True
+                "total_blocks": 1,
                 "block": {
                     "type": "text",
                     "text": "The final answer from the sub-agent.",
@@ -354,12 +381,10 @@ class TestChange4TextBlockRouting:
         captured = capsys.readouterr()
         output = captured.out
 
-        # Attribution header must appear
         assert f"[{_AGENT}]" in output, (
             f"Sub-agent final result must include [{_AGENT}] attribution; "
             f"got: {output!r}"
         )
-        # Result text must appear
         assert "The final answer from the sub-agent." in output, (
             f"Sub-agent final result text missing; got: {output!r}"
         )
@@ -400,50 +425,10 @@ class TestChange4TextBlockRouting:
         )
 
         captured = capsys.readouterr()
-        # Parent path unchanged: Amplifier: label, no sub-agent suppression
         assert "Amplifier:" in captured.out, (
             "Parent intermediate text must still render with 'Amplifier:' label"
         )
         assert "Parent intermediate text." in captured.out
-
-    @pytest.mark.asyncio
-    async def test_final_sub_agent_text_attribution_is_dim_cyan(self, capsys):
-        """Attribution header uses dim cyan styling (Rich dim cyan style)."""
-        hooks = _hooks()
-
-        # Use a Rich console with force_terminal+color_system so ANSI codes are emitted
-        buf = io.StringIO()
-        from rich.console import Console
-
-        real_console_cls = Console
-
-        call_count = 0
-
-        def _capturing_console(*args, **kwargs):
-            nonlocal call_count
-            kwargs["file"] = buf
-            kwargs["force_terminal"] = True
-            kwargs["color_system"] = "standard"
-            call_count += 1
-            return real_console_cls(*args, **kwargs)
-
-        with patch.object(_mod, "Console", side_effect=_capturing_console):
-            await hooks.handle_content_block_end(
-                "content_block:end",
-                {
-                    "block_index": 0,
-                    "total_blocks": 1,
-                    "block": {"type": "text", "text": "Colored attribution."},
-                    "session_id": _SUB_SID,
-                },
-            )
-
-        output = buf.getvalue()
-        # Dim styling → ANSI dim sequence \x1b[2m
-        assert (
-            "\x1b[2m" in output or "dim" in output.lower() or f"[{_AGENT}]" in output
-        ), f"Attribution should carry dim styling; got: {output!r}"
-        assert f"[{_AGENT}]" in output
 
     @pytest.mark.asyncio
     async def test_multiple_sub_agents_each_get_attribution(self, capsys):
@@ -473,16 +458,16 @@ class TestChange4TextBlockRouting:
 
 
 # ===========================================================================
-# Change 5: handle_tool_post — task tool result dedup
+# Change 5 (REVERTED): handle_tool_post — spawn-tool result IS rendered
 # ===========================================================================
 
 
-class TestChange5TaskToolDedup:
-    """task tool result body suppressed for successful sub-agent responses (change 5)."""
+class TestSpawnToolResultRendered:
+    """Spawn-tool result envelope is rendered (dedup removed in revert of change 5)."""
 
     @pytest.mark.asyncio
-    async def test_task_tool_success_shape_suppressed(self, capsys):
-        """task tool with {"response": …, "session_id": …} → result body suppressed."""
+    async def test_task_tool_success_shape_rendered(self, capsys):
+        """task tool with {\"response\": …, \"session_id\": …} → result IS rendered."""
         hooks = _hooks()
 
         result = await hooks.handle_tool_post(
@@ -500,21 +485,16 @@ class TestChange5TaskToolDedup:
         assert result.action == "continue"
 
         captured = capsys.readouterr()
-        # Result body must not appear (attributed final already showed it)
-        assert "The sub-agent finished its work." not in captured.out, (
-            "task tool result body must be suppressed for success shape"
+        # Result envelope MUST appear (dedup removed)
+        assert "Tool result: task" in captured.out, (
+            f"task tool result envelope must render (dedup removed); got: {captured.out!r}"
         )
-        # No tool-result banner either
-        assert "Tool result: task" not in captured.out
 
     @pytest.mark.asyncio
-    async def test_delegate_tool_success_shape_suppressed(self, capsys):
-        """delegate tool (current spawn-tool name) with a response-shaped result
-        -> body suppressed, same as the task alias."""
+    async def test_delegate_tool_success_shape_rendered(self, capsys):
+        """delegate tool with nested output.response → result IS rendered."""
         hooks = _hooks()
 
-        # Real delegate envelope shape (verified from a live tool:post event):
-        # the response is NESTED under "output", with routing metadata around it.
         result = await hooks.handle_tool_post(
             "tool:post",
             {
@@ -539,10 +519,10 @@ class TestChange5TaskToolDedup:
         assert result.action == "continue"
 
         captured = capsys.readouterr()
-        assert "The delegated agent finished its work." not in captured.out
-        assert "Tool result: delegate" not in captured.out
-        # The routing envelope must not leak either
-        assert "provider_routing" not in captured.out
+        # Result envelope MUST appear (dedup removed)
+        assert "Tool result: delegate" in captured.out, (
+            f"delegate tool result envelope must render (dedup removed); got: {captured.out!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_task_tool_error_shape_rendered(self, capsys):
@@ -564,7 +544,6 @@ class TestChange5TaskToolDedup:
         assert result.action == "continue"
 
         captured = capsys.readouterr()
-        # Error must appear — do not hide failures
         assert (
             "Agent timed out" in captured.out or "Tool result: task" in captured.out
         ), "task tool error result must not be suppressed"
@@ -610,7 +589,6 @@ class TestChange5TaskToolDedup:
         assert result.action == "continue"
 
         captured = capsys.readouterr()
-        # bash tool result must be rendered (not suppressed like task tool)
         assert (
             "bash output here" in captured.out or "Tool result: bash" in captured.out
         ), "Non-task tool result must render normally even if it has 'response' key"
@@ -630,8 +608,7 @@ class TestChange5TaskToolDedup:
 
         assert isinstance(result, HookResult)
         assert result.action == "continue"
-
-        # Empty dict has no "response" key → should not be suppressed.
+        # Empty dict has no "response" key — should not be suppressed.
         # Just verify it returns continue without error.
 
 
@@ -641,15 +618,14 @@ class TestChange5TaskToolDedup:
 
 
 class TestParentPathUnchanged:
-    """Verify key parent-path invariants still hold after curated changes."""
+    """Verify key parent-path invariants still hold after reverted changes."""
 
     @pytest.mark.asyncio
     async def test_parent_final_text_NOT_rendered_by_hook(self, capsys):
         """Parent final text is NOT painted by the hook (#256 fix; regression guard).
 
-        Changed in fix/256-hook-skip-final: handle_content_block_end skips
-        is_last_block=True for parent (agent_name=None) sessions. app-cli's
-        render_message is the sole owner. Old test asserted the opposite.
+        handle_content_block_end skips is_last_block=True for parent (agent_name=None).
+        app-cli's render_message is the sole owner.
         """
         hooks = _hooks()
 
