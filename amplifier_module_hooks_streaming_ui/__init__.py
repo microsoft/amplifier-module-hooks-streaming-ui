@@ -10,6 +10,8 @@ import logging
 import math
 import re
 import sys
+import time
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +25,54 @@ from rich.styled import Styled
 from rich.text import Text
 
 logger = logging.getLogger(__name__)
+
+
+# ─── THROTTLE/COALESCE spike (revertable, display-only) ─────────────────────
+# While the user is composing a mid-turn steer, the pinned steering prompt
+# and the streaming Live preview repaint independently, fighting each other
+# for the terminal. COALESCE_S bounds how often the streaming preview
+# physically repaints WHILE a steer is being composed -- output is never
+# hidden (the buffer keeps accumulating every delta; only the on-screen
+# refresh cadence is reduced). When no steer is being composed, the preview
+# refreshes on every delta exactly as it always has.
+COALESCE_S = 0.25
+
+
+def should_refresh(
+    is_composing: bool,
+    now: float,
+    last_refresh: float,
+    coalesce_s: float = COALESCE_S,
+    *,
+    force: bool = False,
+) -> bool:
+    """Decide whether the streaming Live region should physically repaint now.
+
+    Pure decision function -- no Rich/Live/terminal dependency -- so the
+    coalesce policy is unit-testable in isolation from rendering concerns.
+
+    Args:
+        is_composing: True while the user has a mid-turn steer prompt open
+            with non-empty draft text (``SteeringInputManager.is_composing``).
+        now: Current monotonic timestamp (e.g. ``time.monotonic()``).
+        last_refresh: Monotonic timestamp of the last physical repaint for
+            this block (0.0 if never refreshed).
+        coalesce_s: Minimum seconds between repaints while composing.
+            Defaults to the module constant ``COALESCE_S`` (0.25s).
+        force: When True, always returns True regardless of the other
+            arguments. Used by the block-end flush path to guarantee the
+            final buffered text is painted before the Live region closes.
+
+    Returns:
+        True if a physical repaint should happen now, False if the repaint
+        should be skipped (the caller keeps accumulating into the buffer
+        and will retry the decision on the next delta).
+    """
+    if force:
+        return True
+    if not is_composing:
+        return True
+    return (now - last_refresh) >= coalesce_s
 
 
 # ─── Left-aligned Markdown ────────────────────────────────────────────────────
@@ -93,6 +143,15 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         overlay_active=overlay_active,
         spawn_tools=spawn_tools,
     )
+
+    # THROTTLE/COALESCE spike (revertable, display-only): publish the
+    # StreamingUIHooks instance as a capability so app-cli's
+    # _execute_with_interrupt can reach it and wire up
+    # hooks._composing_fn = manager.is_composing. Registered unconditionally
+    # (cheap, no behavior change on its own) so app-cli's get_capability()
+    # call finds it whenever this module version is mounted; an app-cli
+    # built against an older module simply gets None back (back-compat).
+    coordinator.register_capability("ui.streaming_hooks", hooks)
 
     # Register atomic handlers (existing — unchanged in v2)
     coordinator.hooks.register(
@@ -247,6 +306,13 @@ class StreamingUIHooks:
         # _spawn_tools: names of tools that spawn sub-agents (config-driven).
         # Used to gate the static per-spawn marker printed in handle_tool_pre.
         self._spawn_tools: tuple[str, ...] = tuple(spawn_tools)
+        # THROTTLE/COALESCE spike (revertable, display-only): settable from
+        # outside (app-cli's _execute_with_interrupt) to a zero-arg callable
+        # returning True while the user is composing a mid-turn steer
+        # (SteeringInputManager.is_composing). None (default) means "not
+        # composing" -- the streaming Live preview refreshes on every delta
+        # exactly as it always has. See _make_streaming_overlay's _on_delta.
+        self._composing_fn: Callable[[], bool] | None = None
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
@@ -1431,6 +1497,10 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
             "live": None,
             "escape_pending": "",
             "name": data.get("name"),
+            # THROTTLE/COALESCE spike: monotonic timestamp of the last
+            # physical Live repaint for this block. 0.0 means "never
+            # refreshed" -- should_refresh() treats that as due immediately.
+            "last_refresh": 0.0,
         }
         s["blocks"][idx] = block
         agent = s["agent"]
@@ -1466,11 +1536,18 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                         # Text blocks lead with the bold-green "Amplifier:"
                         # label INSIDE the transient Live (see _text_renderable).
                         initial = _text_renderable("")
+                    # THROTTLE/COALESCE spike: auto_refresh=False -- Rich's
+                    # background refresh thread (the old refresh_per_second=10)
+                    # repaints on its own schedule REGARDLESS of live.update()
+                    # calls, so it cannot be throttled by skipping updates.
+                    # Disabling it and driving live.update(..., refresh=...)
+                    # ourselves in _on_delta is the only way to actually
+                    # control repaint cadence while a steer is being composed.
                     live = Live(
                         initial,
                         console=parent_console,
                         transient=True,
-                        refresh_per_second=10,
+                        auto_refresh=False,
                     )
                     live.start()
                     block["live"] = live
@@ -1506,6 +1583,7 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                 "live": None,
                 "escape_pending": "",
                 "name": None,
+                "last_refresh": 0.0,
             }
             s["blocks"][idx] = block
 
@@ -1526,6 +1604,21 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
             live = block.get("live")
             if live is not None:
                 try:
+                    # THROTTLE/COALESCE spike: the buffer above has already
+                    # accumulated `clean` regardless of what happens next --
+                    # output is never hidden, only the physical repaint
+                    # cadence is gated while a steer is being composed.
+                    is_composing = False
+                    if hooks_instance._composing_fn is not None:
+                        try:
+                            is_composing = bool(hooks_instance._composing_fn())
+                        except Exception:
+                            is_composing = False
+                    now = time.monotonic()
+                    do_refresh = should_refresh(
+                        is_composing, now, block.get("last_refresh", 0.0)
+                    )
+
                     btype = block.get("type", "text")
                     if btype == "thinking":
                         # Reserve 4 extra lines for the 4 frame lines
@@ -1544,7 +1637,10 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                             lambda t: _thinking_renderable(t, width=console_width),
                             parent_console,
                         )
-                        live.update(_thinking_renderable(tail, width=console_width))
+                        live.update(
+                            _thinking_renderable(tail, width=console_width),
+                            refresh=do_refresh,
+                        )
                     else:
                         try:
                             text_height = parent_console.size.height
@@ -1560,7 +1656,10 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                             _text_renderable,
                             parent_console,
                         )
-                        live.update(_text_renderable(tail))
+                        live.update(_text_renderable(tail), refresh=do_refresh)
+
+                    if do_refresh:
+                        block["last_refresh"] = now
                 except Exception:
                     pass
             else:
@@ -1594,6 +1693,33 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
         buffer = block["buffer"]
 
         if agent is None:
+            # THROTTLE/COALESCE spike: force a final repaint of any pending
+            # buffered text BEFORE closing the Live region. While composing,
+            # some deltas may have accumulated into block["buffer"] without
+            # ever being physically repainted (coalesced). should_refresh(
+            # force=True) always returns True, guaranteeing the last tokens
+            # are shown at least momentarily even though transient=True
+            # clears the region an instant later in _close_live().
+            live = block.get("live")
+            if live is not None and block.get("buffer"):
+                try:
+                    if btype == "thinking":
+                        try:
+                            w = parent_console.size.width
+                        except Exception:
+                            w = 80
+                        live.update(
+                            _thinking_renderable(block["buffer"], width=w),
+                            refresh=should_refresh(False, 0.0, 0.0, force=True),
+                        )
+                    else:
+                        live.update(
+                            _text_renderable(block["buffer"]),
+                            refresh=should_refresh(False, 0.0, 0.0, force=True),
+                        )
+                except Exception:
+                    pass
+
             # Parent: close Live first (clears the transient capped preview).
             _close_live(block)
 
