@@ -343,6 +343,21 @@ class StreamingUIHooks:
         # exactly as it always has. See _make_streaming_overlay's _on_delta.
         self._composing_fn: Callable[[], bool] | None = None
 
+    def set_composing_source(self, fn: Callable[[], bool] | None) -> None:
+        """Register the mid-turn-steer "is composing" predicate.
+
+        Public contract for the app layer (app-cli's _execute_with_interrupt)
+        to wire up ``SteeringInputManager.is_composing`` without reaching into
+        the private ``_composing_fn`` attribute. Callers obtain this hooks
+        instance via ``coordinator.get_capability("ui.streaming_hooks")``.
+
+        Args:
+            fn: A zero-arg callable returning True while the user has a
+                non-empty mid-turn steer draft open, or None to clear the
+                source (the default "not composing" behavior).
+        """
+        self._composing_fn = fn
+
     # ── Formula helper ─────────────────────────────────────────────────────
 
     def _compute_total_input(self, usage: dict) -> int:
@@ -1769,16 +1784,44 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                 try:
                     if btype == "thinking":
                         try:
-                            w = parent_console.size.width
+                            console_height = parent_console.size.height
+                            console_width = parent_console.size.width
                         except Exception:
-                            w = 80
+                            console_height = 24
+                            console_width = 80
+                        # Tail-cap the forced final repaint the same way the
+                        # streaming delta path does: reserve 4 frame lines
+                        # (===, header, ---, ===) plus the shared 5-line margin
+                        # so a large coalesced buffer cannot exceed terminal
+                        # height when flushed at block-end.
+                        budget = max(5, console_height - 5 - 4)
+                        tail = _fit_tail_to_height(
+                            block["buffer"],
+                            budget,
+                            lambda t: _thinking_renderable(t, width=console_width),
+                            parent_console,
+                        )
                         live.update(
-                            _thinking_renderable(block["buffer"], width=w),
+                            _thinking_renderable(tail, width=console_width),
                             refresh=should_refresh(False, 0.0, 0.0, force=True),
                         )
                     else:
+                        try:
+                            text_height = parent_console.size.height
+                        except Exception:
+                            text_height = 24
+                        # Reserve 2 lines for the blank separator + "Amplifier:"
+                        # label that _text_renderable prepends, matching the
+                        # streaming delta path budget arithmetic.
+                        budget = max(5, text_height - 5 - 2)
+                        tail = _fit_tail_to_height(
+                            block["buffer"],
+                            budget,
+                            _text_renderable,
+                            parent_console,
+                        )
                         live.update(
-                            _text_renderable(block["buffer"]),
+                            _text_renderable(tail),
                             refresh=should_refresh(False, 0.0, 0.0, force=True),
                         )
                 except Exception:
