@@ -75,6 +75,35 @@ def should_refresh(
     return (now - last_refresh) >= coalesce_s
 
 
+def effective_composing(is_composing: bool, steering_active: bool) -> bool:
+    """Broaden the throttle gate to cover the whole time a steering prompt
+    is visible on screen, not only while its draft buffer is non-empty.
+
+    ROOT CAUSE (Option B): a pinned steering prompt fights the streaming
+    Live repaint for the terminal via prompt_toolkit's run_in_terminal for
+    as long as the prompt is on screen -- which is the entire duration
+    ``_composing_fn`` is registered (a turn is in flight), not just the
+    moments the user has typed non-empty draft text. Gating ``should_refresh``
+    on ``is_composing`` alone under-throttles: an empty-but-visible steering
+    prompt still causes an atomic erase/redraw on every delta.
+
+    Args:
+        is_composing: Whether the steer draft buffer currently has text
+            (``SteeringInputManager.is_composing()``).
+        steering_active: Whether a steering prompt capability is registered
+            at all for this turn (``hooks_instance._composing_fn is not
+            None``) -- i.e. whether a pinned prompt COULD be on screen.
+
+    Returns:
+        True if the throttle/coalesce window should apply to this delta.
+        False only when there is no steering prompt on screen at all
+        (``steering_active`` is False) and the draft is empty -- this
+        preserves the original per-delta smooth streaming outside of any
+        steering context.
+    """
+    return is_composing or steering_active
+
+
 # ─── Left-aligned Markdown ────────────────────────────────────────────────────
 # Rich's default Markdown centers headings.  We always want left-aligned.
 # Pattern mirrors amplifier-app-cli/amplifier_app_cli/console.py — defined
@@ -1417,7 +1446,19 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
 
     Returns a dict mapping event_name -> handler coroutine.
     """
-    parent_console = Console(file=sys.stdout, highlight=False)
+    # ROOT-CAUSE FIX (Option B): do NOT capture sys.stdout at mount time.
+    # Rich's Console resolves `file=None` DYNAMICALLY via its `file` property
+    # (falls back to sys.stdout on every write) instead of freezing whatever
+    # sys.stdout WAS at construction time. Mounting happens before any turn's
+    # patch_stdout(raw=True) is active, so binding `file=sys.stdout` here
+    # captured the real terminal stdout permanently -- every later Live
+    # repaint wrote straight to the terminal, bypassing prompt_toolkit's
+    # StdoutProxy (installed by patch_stdout) and fighting the pinned
+    # steering prompt. With `file=None` (the default), each print/repaint
+    # re-reads sys.stdout at call time: during a turn that's the StdoutProxy
+    # (routes through run_in_terminal, same atomic path as tool-block
+    # print()s); outside a turn it's the real stdout, unchanged from before.
+    parent_console = Console(highlight=False)
 
     # state[session_id] = {
     #     "agent": str | None,
@@ -1548,6 +1589,16 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
                         console=parent_console,
                         transient=True,
                         auto_refresh=False,
+                        # ROOT-CAUSE FIX (Option B): don't let Rich wrap
+                        # console.file in its own FileProxy. With the dynamic
+                        # Console (file=None, above) each write already
+                        # re-resolves sys.stdout at call time; adding Rich's
+                        # redirect_stdout FileProxy on top is an unnecessary
+                        # indirection Rich would otherwise have to unwrap via
+                        # rich_proxied_file. Keeping this False routes writes
+                        # straight to the dynamically-resolved stdout (the
+                        # StdoutProxy during a turn, real stdout otherwise).
+                        redirect_stdout=False,
                     )
                     live.start()
                     block["live"] = live
@@ -1604,19 +1655,32 @@ def _make_streaming_overlay(hooks_instance: "StreamingUIHooks"):
             live = block.get("live")
             if live is not None:
                 try:
-                    # THROTTLE/COALESCE spike: the buffer above has already
+                    # THROTTLE/COALESCE: the buffer above has already
                     # accumulated `clean` regardless of what happens next --
                     # output is never hidden, only the physical repaint
-                    # cadence is gated while a steer is being composed.
+                    # cadence is gated while a steering prompt is visible.
+                    #
+                    # ROOT-CAUSE FIX (Option B): gate on `effective_composing`,
+                    # not raw `is_composing`. `is_composing` only reflects
+                    # whether the draft buffer has text; but the pinned
+                    # steering prompt fights the Live repaint over
+                    # run_in_terminal for the WHOLE time it is on screen --
+                    # i.e. for the whole turn `_composing_fn` is registered,
+                    # not just while the user has typed something. Gating on
+                    # `is_composing` alone under-throttles the empty-buffer,
+                    # prompt-visible case.
+                    steering_active = hooks_instance._composing_fn is not None
                     is_composing = False
-                    if hooks_instance._composing_fn is not None:
+                    if steering_active:
                         try:
-                            is_composing = bool(hooks_instance._composing_fn())
+                            is_composing = bool(hooks_instance._composing_fn())  # type: ignore[misc]
                         except Exception:
                             is_composing = False
                     now = time.monotonic()
                     do_refresh = should_refresh(
-                        is_composing, now, block.get("last_refresh", 0.0)
+                        effective_composing(is_composing, steering_active),
+                        now,
+                        block.get("last_refresh", 0.0),
                     )
 
                     btype = block.get("type", "text")

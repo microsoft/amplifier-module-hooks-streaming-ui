@@ -112,3 +112,53 @@ class TestForceFlushAlwaysRefreshes:
             )
             is True
         )
+
+
+def _effective_composing(*args, **kwargs):
+    """Import indirection so a missing symbol produces a clear failure."""
+    return _mod.effective_composing(*args, **kwargs)
+
+
+class TestEffectiveComposingBroadensThrottleGate:
+    """FAILING-TEST-FIRST: root-cause fix for issue Option B.
+
+    Root cause: the throttle gate only looked at ``is_composing`` (whether
+    the steer draft buffer is non-empty), but the pinned steering prompt is
+    visible -- and fighting the Live repaint via run_in_terminal -- for the
+    ENTIRE time a steering prompt is on screen, not just while the user has
+    typed something into it. ``effective_composing`` broadens the gate to
+    fire whenever a steering prompt is active (``_composing_fn is not
+    None``), regardless of whether the draft buffer is currently empty.
+
+    Written BEFORE ``effective_composing`` exists in
+    ``amplifier_module_hooks_streaming_ui`` and MUST fail on an unmodified
+    checkout (AttributeError), then pass once the helper is implemented.
+    """
+
+    def test_both_false_is_false(self):
+        """No steering prompt, empty draft -> no throttle (today's smooth streaming)."""
+        assert _effective_composing(is_composing=False, steering_active=False) is False
+
+    def test_composing_without_steering_active_is_true(self):
+        """Draft non-empty (composing) implies the prompt is visible -> throttle."""
+        assert _effective_composing(is_composing=True, steering_active=False) is True
+
+    def test_steering_active_with_empty_draft_is_true(self):
+        """This is THE root-cause case: a steering prompt is pinned on screen
+        (steering_active=True) but the draft buffer is currently empty
+        (is_composing=False). The old code only threw is_composing into
+        should_refresh, so it would NOT throttle here even though the pinned
+        prompt is on screen fighting the Live repaint every delta. The fix
+        must throttle in this case too."""
+        assert _effective_composing(is_composing=False, steering_active=True) is True
+
+    def test_both_true_is_true(self):
+        assert _effective_composing(is_composing=True, steering_active=True) is True
+
+    def test_no_composing_fn_means_not_steering_active_never_throttles(self):
+        """When there is no steering prompt capability at all
+        (_composing_fn is None -> steering_active=False) and the draft is
+        empty (is_composing=False), effective_composing must be False so
+        should_refresh returns True on every delta -- preserving today's
+        smooth per-delta streaming outside of any steering context."""
+        assert _effective_composing(is_composing=False, steering_active=False) is False
