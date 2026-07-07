@@ -286,3 +286,212 @@ async def test_orchestrator_complete_fires_for_root_with_uuid_session_id(capsys)
     assert "$0.09" in captured.out
     assert isinstance(result, HookResult)
     assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# Resume cost baseline: the prompt:submit seed handler
+#
+# On a resumed session app-cli restores prior spend by registering a
+# history:<session_id> contributor on the session.cost channel *before* the
+# first turn runs.  Without a pre-turn baseline the first orchestrator:complete
+# reports the entire cumulative total as this turn's cost (Turn == Session on
+# the first line after resume).  The prompt:submit seed handler captures the
+# pre-turn snapshot into state["prev_total"] so the first turn's delta is right.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_seed_produces_correct_first_turn_delta(capsys):
+    """Resumed session: first turn shows the delta, not the whole restored total.
+
+    Sequence:
+      1. prompt:submit fires -> channel has the restored history contributor
+         ($5.00). Seed captures prev_total = $5.00.
+      2. First turn runs; provider adds $0.10 -> channel total $5.10.
+      3. orchestrator:complete -> Turn = $5.10 - $5.00 = $0.10, Session = $5.10.
+    """
+    coordinator = MagicMock()
+
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler,
+        _make_cost_seed_handler,
+    )
+
+    complete_handler, state = _make_cost_handler(coordinator)
+    seed_handler = _make_cost_seed_handler(coordinator, state)
+
+    # 1. Pre-turn snapshot on resume: only the restored history contributor.
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("5.00")}]
+    )
+    await seed_handler("prompt:submit", {})
+    assert state["prev_total"] == Decimal("5.00")
+
+    # 2 + 3. First turn completes with the restored total plus this turn's cost.
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("5.10")}]
+    )
+    await complete_handler("orchestrator:complete", {})
+    captured = capsys.readouterr()
+
+    assert "Turn: $0.10" in captured.out
+    assert "Session: $5.10" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_seed_is_noop(capsys):
+    """Fresh session: nothing on the channel at prompt:submit -> baseline stays None.
+
+    The first turn must still report Turn == Session (the whole first-turn cost),
+    exactly as before this fix.
+    """
+    coordinator = MagicMock()
+
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler,
+        _make_cost_seed_handler,
+    )
+
+    complete_handler, state = _make_cost_handler(coordinator)
+    seed_handler = _make_cost_seed_handler(coordinator, state)
+
+    # Fresh session: no contributors yet at prompt:submit.
+    coordinator.collect_contributions = AsyncMock(return_value=[])
+    await seed_handler("prompt:submit", {})
+    assert state["prev_total"] is None
+
+    # First turn completes at $0.09.
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.09")}]
+    )
+    await complete_handler("orchestrator:complete", {})
+    captured = capsys.readouterr()
+
+    assert "Turn: $0.09" in captured.out
+    assert "Session: $0.09" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_seed_only_fires_once(capsys):
+    """The seed handler acts only on the first turn; turn 2+ baselines are owned
+    by the complete handler and must not be re-seeded."""
+    coordinator = MagicMock()
+
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler,
+        _make_cost_seed_handler,
+    )
+
+    complete_handler, state = _make_cost_handler(coordinator)
+    seed_handler = _make_cost_seed_handler(coordinator, state)
+
+    # Turn 1: seed from restored history, complete at $5.10.
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("5.00")}]
+    )
+    await seed_handler("prompt:submit", {})
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("5.10")}]
+    )
+    await complete_handler("orchestrator:complete", {})
+    capsys.readouterr()
+
+    # Turn 2: seed must be a no-op even though the channel total changed.
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("5.10")}]
+    )
+    await seed_handler("prompt:submit", {})
+    assert state["prev_total"] == Decimal("5.10")  # unchanged by the seed
+
+    # Turn 2 completes at $5.25 -> Turn = $0.15.
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("5.25")}]
+    )
+    await complete_handler("orchestrator:complete", {})
+    captured = capsys.readouterr()
+    assert "Turn: $0.15" in captured.out
+    assert "Session: $5.25" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_seed_skips_subsession_none_session_id():
+    """A sub-session prompt:submit (session_id=None) must not seed the root baseline."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.04")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler,
+        _make_cost_seed_handler,
+    )
+
+    _, state = _make_cost_handler(coordinator)
+    seed_handler = _make_cost_seed_handler(coordinator, state)
+
+    await seed_handler("prompt:submit", {"session_id": None})
+    assert state["prev_total"] is None
+
+
+@pytest.mark.asyncio
+async def test_seed_skips_subsession_explicit_id():
+    """A sub-session prompt:submit (underscore session_id) must not seed the baseline."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        return_value=[{"cost_usd": Decimal("0.04")}]
+    )
+
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler,
+        _make_cost_seed_handler,
+    )
+
+    _, state = _make_cost_handler(coordinator)
+    seed_handler = _make_cost_seed_handler(coordinator, state)
+
+    await seed_handler("prompt:submit", {"session_id": "abc-def_agent-name"})
+    assert state["prev_total"] is None
+
+
+@pytest.mark.asyncio
+async def test_seed_degrades_on_error():
+    """Seeding is best-effort: if collect_contributions raises, the turn proceeds
+    with prev_total left as None (falls back to first-turn behavior)."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(
+        side_effect=RuntimeError("contributor exploded")
+    )
+
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler,
+        _make_cost_seed_handler,
+    )
+
+    _, state = _make_cost_handler(coordinator)
+    seed_handler = _make_cost_seed_handler(coordinator, state)
+
+    result = await seed_handler("prompt:submit", {})
+    assert state["prev_total"] is None
+    assert isinstance(result, HookResult)
+    assert result.action == "continue"
+
+
+@pytest.mark.asyncio
+async def test_mount_registers_prompt_submit_cost_seed():
+    """mount() registers a prompt:submit handler to seed the cost baseline."""
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=[])
+    registered_hooks = {}
+
+    def capture_hook(event, handler, **kwargs):
+        registered_hooks.setdefault(event, []).append(kwargs.get("name"))
+
+    coordinator.hooks.register = capture_hook
+    coordinator.mount = AsyncMock()
+
+    from amplifier_module_hooks_streaming_ui import mount
+
+    await mount(coordinator, config={})
+
+    assert "prompt:submit" in registered_hooks
+    assert "streaming-ui-cost-seed" in registered_hooks["prompt:submit"]
