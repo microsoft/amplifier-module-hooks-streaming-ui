@@ -203,9 +203,19 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
         "llm:response", hooks.handle_llm_response, name="streaming-ui-llm-response"
     )
     if show_token_usage:
-        _cost_handler, _ = _make_cost_handler(coordinator, hooks=hooks)
+        _cost_handler, _cost_state = _make_cost_handler(coordinator, hooks=hooks)
         coordinator.hooks.register(
             "orchestrator:complete", _cost_handler, name="streaming-ui-cost-summary"
+        )
+        # Seed the per-turn cost baseline at the start of the first turn.  On a
+        # resumed session app-cli restores prior spend as a history:<session_id>
+        # contributor on the session.cost channel before the first turn runs;
+        # without a baseline the first turn's delta would report the whole
+        # cumulative total as *this* turn's cost.  Fresh sessions have no prior
+        # contributor, so the baseline stays None and behavior is unchanged.
+        _cost_seed_handler = _make_cost_seed_handler(coordinator, _cost_state)
+        coordinator.hooks.register(
+            "prompt:submit", _cost_seed_handler, name="streaming-ui-cost-seed"
         )
 
     # Register the deferred-flush handler on cleanup:render_end when the overlay
@@ -2000,6 +2010,48 @@ def _make_cost_handler(coordinator, hooks=None):
         return HookResult(action="continue")
 
     return _on_orchestrator_complete, state
+
+
+def _make_cost_seed_handler(coordinator, state):
+    """Create the prompt:submit handler that seeds the per-turn cost baseline.
+
+    The orchestrator:complete cost handler reports each turn's cost as the delta
+    between the current session.cost total and state["prev_total"].  On the very
+    first turn of a process prev_total is None, so it falls back to reporting the
+    whole session total as the turn cost.  That fallback is correct for a *fresh*
+    session (nothing came before) but wrong for a *resumed* one: app-cli restores
+    prior spend by registering a history:<session_id> contributor on session.cost
+    before the first turn runs, so the first post-resume total already includes
+    everything spent in previous runs.  Without a baseline the first line after a
+    resume shows Turn == Session (e.g. "Turn: $5.10 | Session: $5.10").
+
+    This handler captures the pre-turn session.cost snapshot into
+    state["prev_total"] once, at the start of the first turn this process handles,
+    so the first orchestrator:complete computes a correct delta.  Turn 2+ baselines
+    are maintained by the complete handler itself, so this only ever acts once.
+    """
+
+    async def _on_prompt_submit(event: str, data: dict):
+        # Only seed the first turn; after that the complete handler owns prev_total.
+        if state["prev_total"] is not None:
+            return HookResult(action="continue")
+        # Mirror the complete handler's sub-session guard: a sub-session prompt
+        # must never seed the root baseline.  (Sub-sessions carry a session_id
+        # with an "_" delimiter, or omit the id as None.)
+        session_id = data.get("session_id")
+        if "session_id" in data and session_id is None:
+            return HookResult(action="continue")
+        if session_id and "_" in session_id:
+            return HookResult(action="continue")
+        try:
+            contributions = await coordinator.collect_contributions("session.cost")
+            state["prev_total"] = _sum_cost_usd(contributions)
+        except Exception:
+            # Baseline seeding is best-effort display polish; never disrupt the turn.
+            pass
+        return HookResult(action="continue")
+
+    return _on_prompt_submit
 
 
 __all__ = [
