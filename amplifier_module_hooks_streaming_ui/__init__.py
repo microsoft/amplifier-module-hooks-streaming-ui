@@ -16,12 +16,15 @@ from decimal import Decimal
 from typing import Any
 
 from amplifier_core.models import HookResult
-from rich.console import Console, Group
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
+from rich.markdown import CodeBlock as _RichCodeBlock
 from rich.markdown import Heading as _RichHeading
 from rich.markdown import Markdown as _RichMarkdown
 from rich.padding import Padding
+from rich.rule import Rule
 from rich.styled import Styled
+from rich.syntax import Syntax
 from rich.text import Text
 
 logger = logging.getLogger(__name__)
@@ -130,17 +133,53 @@ class _LeftAlignedHeading(_RichHeading):
             yield text
 
 
+# ─── Copy/paste-clean code blocks ────────────────────────────────────────
+# Rich's stock CodeBlock renders via Syntax(..., padding=1), which writes a
+# literal space character onto the left (and right) of every line -- a real
+# character in the terminal's screen buffer that a mouse-drag/triple-click
+# copy captures. amplifier-app-cli/amplifier_app_cli/console.py fixed this
+# for the settled assistant-message render; this module has its own local
+# Markdown subclass (see note above) so the same fix must be duplicated
+# here, or streaming/intermediate previews keep the padded, un-copy-pasteable
+# fences even after the settled render is clean.
+
+
+class _CopyPasteCodeBlock(_RichCodeBlock):
+    """Code block with no per-line whitespace padding, for clean copy/paste.
+
+    Mirrors amplifier-app-cli/amplifier_app_cli/console.py:CopyPasteCodeBlock --
+    keeps the block visually identifiable (background tint + syntax
+    highlighting, plus a thin rule above/below) without baking padding
+    characters into the code lines themselves.
+    """
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        code = str(self.text).rstrip()
+        yield Rule(style="dim", characters="\u2500")
+        yield Syntax(
+            code,
+            self.lexer_name,
+            theme=self.theme,
+            word_wrap=True,
+            padding=0,
+        )
+        yield Rule(style="dim", characters="\u2500")
+
+
 class Markdown(_RichMarkdown):
-    """Markdown with left-aligned headings.
+    """Markdown with left-aligned headings and copy/paste-clean code blocks.
 
     Drop-in replacement for rich.markdown.Markdown used throughout this module
-    so headings never centre-align, whether in the streaming Live preview, the
-    final thinking render, or intermediate text blocks.
+    so headings never centre-align and fenced code has no injected padding,
+    whether in the streaming Live preview, the final thinking render, or
+    intermediate text blocks.
     """
 
     elements = {
         **_RichMarkdown.elements,
         "heading_open": _LeftAlignedHeading,
+        "fence": _CopyPasteCodeBlock,  # ``` code blocks: no copy/paste padding
+        "code_block": _CopyPasteCodeBlock,  # indented code blocks: same treatment
     }
 
 
