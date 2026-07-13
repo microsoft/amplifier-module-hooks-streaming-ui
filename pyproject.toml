@@ -18,7 +18,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "amplifier-core>=1.0.10",
-    "pytest>=8.4.2",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.0.0",
 ]
 
