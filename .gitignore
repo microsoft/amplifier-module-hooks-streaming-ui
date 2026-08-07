@@ -69,3 +69,6 @@ next-steps.md
 # Working folders
 ai_working/tmp
 .beads/*.db
+
+# Task artifacts
+.next/

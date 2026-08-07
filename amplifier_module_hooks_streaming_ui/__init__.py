@@ -409,23 +409,24 @@ class StreamingUIHooks:
 
     # ── Formula helper ─────────────────────────────────────────────────────
 
-    def _compute_total_input(self, usage: dict) -> int:
+    def _compute_total_input(self, usage: dict, provider: str | None = None) -> int:
         """Compute gross total input tokens.
 
-        All providers report input_tokens as the gross total —
-        fresh tokens plus any tokens read from the prompt cache.
-        cache_read is already counted inside input_tokens, so adding
-        it again would double-count. cache_write_tokens is the
-        exception: cache creation cost is billed on top of gross
-        and is NOT included in input_tokens.
+        input_tokens already includes cache reads for all providers. OpenAI also
+        includes cache writes, while other providers report cache creation
+        separately and require it to be added.
 
         Args:
             usage: Usage dict from the event
+            provider: Provider name, when known
 
         Returns:
             Gross total input token count
         """
         input_tokens = usage.get("input_tokens") or 0
+        if (provider or "").lower().startswith("openai"):
+            return input_tokens
+
         cache_create = (
             usage.get("cache_write_tokens")
             or usage.get("cache_creation_input_tokens")
@@ -723,14 +724,34 @@ class StreamingUIHooks:
 
             # Cache metrics (Anthropic splits input into cached/uncached buckets)
             # Support both Anthropic-SDK field names and amplifier-core Usage model names
-            cache_read = (
-                usage.get("cache_read_input_tokens")
-                or usage.get("cache_read_tokens")
+            provider = (self.last_llm_info or {}).get("provider")
+            is_openai = isinstance(provider, str) and provider.lower().startswith(
+                "openai"
+            )
+            cache_read_input = usage.get("cache_read_input_tokens")
+            cache_read_fallback = usage.get("cache_read_tokens")
+            if is_openai:
+                # OpenAI distinguishes measured zero from unavailable telemetry.
+                cache_read = (
+                    cache_read_input
+                    if cache_read_input is not None
+                    else cache_read_fallback or 0
+                )
+            else:
+                # Preserve Anthropic's legacy value fallback: a zero raw field
+                # falls through to a positive canonical alternate.
+                cache_read = cache_read_input or cache_read_fallback or 0
+            cache_create = (
+                usage.get("cache_creation_input_tokens")
+                or usage.get("cache_write_tokens")
                 or 0
+            )
+            has_openai_cache_read = is_openai and (
+                cache_read_input is not None or cache_read_fallback is not None
             )
 
             # Compute actual total input using helper (fixes double-count bug)
-            total_input = self._compute_total_input(usage)
+            total_input = self._compute_total_input(usage, provider)
             total_tokens = total_input + output_tokens
 
             # Format numbers with thousands separators
@@ -740,17 +761,12 @@ class StreamingUIHooks:
 
             # Build cache info string if caching is active
             cache_info = ""
-            if cache_read > 0:
+            if cache_read > 0 or has_openai_cache_read:
                 cache_pct = (
                     int((cache_read / total_input) * 100) if total_input > 0 else 0
                 )
                 cache_info = f" ({cache_pct}% cached)"
             else:
-                cache_create = (
-                    usage.get("cache_creation_input_tokens")
-                    or usage.get("cache_write_tokens")
-                    or 0
-                )
                 if cache_create > 0:
                     # First request - cache being created
                     cache_info = " (caching...)"
