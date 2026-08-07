@@ -53,3 +53,36 @@ def test_hybrid_event_raw_and_canonical_fields_both_present():
     }
     total_input = hooks._compute_total_input(usage)
     assert total_input == 54_230  # 51095 + 3135, NOT 105315 (double-count)
+
+
+def test_openai_cache_write_not_double_counted():
+    """OpenAI input_tokens already includes cache writes."""
+    hooks = StreamingUIHooks(
+        show_thinking=False, show_tool_lines=5, show_token_usage=True
+    )
+    usage = {
+        "input_tokens": 13_000,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 3_000,
+        "output_tokens": 200,
+    }
+
+    total_input = hooks._compute_total_input(usage, "OpenAI Responses")
+
+    assert total_input == 13_000
+
+
+def test_anthropic_provider_preserves_cache_creation_addition():
+    """Anthropic still adds cache creation tokens to input_tokens."""
+    hooks = StreamingUIHooks(
+        show_thinking=False, show_tool_lines=5, show_token_usage=True
+    )
+    usage = {
+        "input_tokens": 10_000,
+        "cache_creation_input_tokens": 3_000,
+        "output_tokens": 200,
+    }
+
+    total_input = hooks._compute_total_input(usage, "anthropic")
+
+    assert total_input == 13_000

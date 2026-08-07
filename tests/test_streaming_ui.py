@@ -143,10 +143,10 @@ async def test_mount_with_defaults():
 
     await mount(coordinator, config)
 
-    # Should register 6 hooks:
+    # Should register 7 hooks:
     #   content_block:start, content_block:end, tool:pre, tool:post,
-    #   llm:response, orchestrator:complete
-    assert coordinator.hooks.register.call_count == 6
+    #   llm:response, orchestrator:complete, prompt:submit
+    assert coordinator.hooks.register.call_count == 7
 
 
 @pytest.mark.asyncio
@@ -578,6 +578,204 @@ class TestStreamingUIHooks:
 
         # State should be cleared after rendering
         assert hooks.last_llm_info is None
+
+    @pytest.mark.asyncio
+    async def test_openai_explicit_zero_cache_read_renders_zero_percent(self, capsys):
+        """An explicit OpenAI zero cache read is meaningful and renders 0%."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        hooks.last_llm_info = {
+            "provider": "OpenAI Responses",
+            "model": "gpt-5",
+            "duration_ms": None,
+        }
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "cache_read_tokens": 0,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Input: 1,000 (0% cached)" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_openai_mixed_cache_read_write_uses_gross_input_denominator(
+        self, capsys
+    ):
+        """OpenAI cache percentage and totals use gross input_tokens only."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        hooks.last_llm_info = {
+            "provider": "openai-compatible",
+            "model": "gpt-5",
+            "duration_ms": None,
+        }
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "cache_read_tokens": 250,
+                "cache_write_tokens": 500,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Input: 1,000 (25% cached)" in captured.out
+        assert "Total: 1,100" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_openai_absent_cache_read_does_not_render_zero_percent(self, capsys):
+        """Missing OpenAI cache read telemetry is not inferred as zero."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        hooks.last_llm_info = {
+            "provider": "openai",
+            "model": "gpt-5",
+            "duration_ms": None,
+        }
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Input: 1,000" in captured.out
+        assert "% cached" not in captured.out
+        assert "caching..." not in captured.out
+
+    @pytest.mark.asyncio
+    async def test_openai_null_cache_read_does_not_render_zero_percent(self, capsys):
+        """Null OpenAI cache fields represent unavailable telemetry, not zero."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        hooks.last_llm_info = {
+            "provider": "openai",
+            "model": "gpt-5",
+            "duration_ms": None,
+        }
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "cache_read_input_tokens": None,
+                "cache_read_tokens": None,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Input: 1,000" in captured.out
+        assert "% cached" not in captured.out
+
+    @pytest.mark.asyncio
+    async def test_anthropic_zero_raw_cache_read_falls_back_to_canonical(
+        self, capsys
+    ):
+        """Anthropic retains truthy fallback when both cache aliases are present."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        hooks.last_llm_info = {
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "duration_ms": None,
+        }
+        data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "cache_read_input_tokens": 0,
+                "cache_read_tokens": 250,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", data)
+
+        captured = capsys.readouterr()
+        assert "Input: 1,000 (25% cached)" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_anthropic_cache_percentage_and_creation_fallback_preserved(
+        self, capsys
+    ):
+        """Anthropic still adds cache creation and retains both cache labels."""
+        hooks = StreamingUIHooks(
+            show_thinking=True, show_tool_lines=5, show_token_usage=True
+        )
+        hooks.last_llm_info = {
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "duration_ms": None,
+        }
+        read_data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "cache_read_input_tokens": 250,
+                "cache_creation_input_tokens": 500,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", read_data)
+
+        read_output = capsys.readouterr().out
+        assert "Input: 1,500 (16% cached)" in read_output
+        assert "Total: 1,600" in read_output
+
+        hooks.last_llm_info = {
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "duration_ms": None,
+        }
+        create_data = {
+            "block_index": 0,
+            "total_blocks": 1,
+            "block": {"type": "text", "text": "Hello"},
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "cache_creation_input_tokens": 500,
+            },
+        }
+
+        await hooks.handle_content_block_end("content_block:end", create_data)
+
+        create_output = capsys.readouterr().out
+        assert "Input: 1,500 (caching...)" in create_output
+        assert "Total: 1,600" in create_output
 
 
 @pytest.mark.asyncio
