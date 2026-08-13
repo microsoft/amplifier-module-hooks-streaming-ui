@@ -143,10 +143,12 @@ async def test_mount_with_defaults():
 
     await mount(coordinator, config)
 
-    # Should register 6 hooks:
+    # Should register 8 hooks:
     #   content_block:start, content_block:end, tool:pre, tool:post,
-    #   llm:response, orchestrator:complete
-    assert coordinator.hooks.register.call_count == 6
+    #   llm:response, provider:resolve, orchestrator:complete, prompt:submit
+    #   (the last two are the cost-summary and cost-seed handlers, both
+    #   gated on show_token_usage which defaults to True)
+    assert coordinator.hooks.register.call_count == 8
 
 
 @pytest.mark.asyncio
@@ -164,10 +166,11 @@ async def test_mount_with_token_usage_disabled_skips_cost_handler():
 
     await mount(coordinator, config)
 
-    # Only 5 hooks: content_block:start, content_block:end, tool:pre, tool:post,
-    # llm:response.
-    # orchestrator:complete is NOT registered when show_token_usage=False.
-    assert coordinator.hooks.register.call_count == 5
+    # Only 6 hooks: content_block:start, content_block:end, tool:pre, tool:post,
+    # llm:response, provider:resolve.
+    # orchestrator:complete and prompt:submit (cost handlers) are NOT
+    # registered when show_token_usage=False.
+    assert coordinator.hooks.register.call_count == 6
 
     registered_events = [
         call[0][0] for call in coordinator.hooks.register.call_args_list
@@ -758,7 +761,9 @@ class TestTokenUsageCostDisplay:
                 "input_tokens": 1000,
                 "output_tokens": 500,
                 "total_tokens": 1500,
-                "cost_usd": "0.0043",  # sub-cent: formats as $0.0043
+                # Real but under half a cent: renders as the sub-cent marker,
+                # never "$0.00" (which would read as free).
+                "cost_usd": "0.0043",
             },
         }
 
@@ -766,9 +771,10 @@ class TestTokenUsageCostDisplay:
 
         captured = capsys.readouterr()
         assert "Cost:" in captured.out, "Cost field missing from Token Usage line"
-        assert "$0.0043" in captured.out, (
-            f"Expected $0.0043 in output, got: {captured.out}"
+        assert "<$0.01" in captured.out, (
+            f"Expected <$0.01 in output, got: {captured.out}"
         )
+        assert "$0.00" not in captured.out, "a real cost must never read as free"
         # Full expected format check
         assert "Input: 1,000" in captured.out
         assert "Output: 500" in captured.out

@@ -16,24 +16,26 @@ class TestFormatCostUsd:
     def test_zero_returns_zero_dollars(self):
         assert format_cost_usd(Decimal("0")) == "$0.00"
 
-    def test_above_one_cent_uses_two_decimal_places(self):
+    def test_values_render_as_two_decimal_money(self):
         assert format_cost_usd(Decimal("0.09")) == "$0.09"
         assert format_cost_usd(Decimal("1.23")) == "$1.23"
 
-    def test_sub_cent_uses_two_significant_figures(self):
-        assert format_cost_usd(Decimal("0.0043")) == "$0.0043"
-        assert format_cost_usd(Decimal("0.0001")) == "$0.0001"
+    def test_sub_half_cent_never_renders_as_free(self):
+        """Below half a cent there is no honest 2dp rendering, so report an
+        upper bound.  "$0.00" is reserved for known-free."""
+        assert format_cost_usd(Decimal("0.0043")) == "<$0.01"
+        assert format_cost_usd(Decimal("0.0001")) == "<$0.01"
 
-    def test_sub_cent_truncates_raw_decimal_arithmetic(self):
+    def test_display_rounds_raw_decimal_arithmetic_to_cents(self):
         """Regression for #231: raw Decimal values with many decimal places are
-        formatted to 2 significant figures, not shown as-is.
+        rounded for display, not shown as-is.
 
-        Brian saw "$0.00639785" in the display — the correct output is "$0.0064".
-        The formatter must round to 2 sig figs, never leak raw Decimal precision.
+        Brian saw "$0.00639785" in the display.  The display must never leak raw
+        Decimal precision — it rounds to the nearest cent.
         """
-        assert format_cost_usd(Decimal("0.00639785")) == "$0.0064"
-        assert format_cost_usd(Decimal("0.0099")) == "$0.0099"
-        assert format_cost_usd(Decimal("0.0047")) == "$0.0047"
+        assert format_cost_usd(Decimal("0.00639785")) == "$0.01"
+        assert format_cost_usd(Decimal("0.0099")) == "$0.01"
+        assert format_cost_usd(Decimal("0.0047")) == "<$0.01"
 
     def test_string_input_is_coerced(self):
         """format_cost_usd must accept str — cost_usd travels as str through event dicts.
@@ -43,13 +45,128 @@ class TestFormatCostUsd:
         returning '?' via a TypeError on the Decimal comparison.
         """
         assert format_cost_usd("0.09") == "$0.09"
-        assert format_cost_usd("0.0064") == "$0.0064"
+        assert format_cost_usd("0.0064") == "$0.01"
         assert format_cost_usd("0") == "$0.00"
         assert format_cost_usd("not-a-number") == "?"
 
     def test_never_returns_float(self):
         result = format_cost_usd(Decimal("0.05"))
         assert isinstance(result, str)
+
+
+class TestFormatCostUsdRoundsToCents:
+    """Money looks like money: nearest cent, two decimal places.
+
+    Display-only.  The underlying cost_usd values and every accumulation over
+    them stay full-precision Decimal; rounding happens once, at render.
+
+    Values below are REAL measured turn costs.
+    """
+
+    def test_owners_example(self):
+        """The verbatim ask: show $0.06, not $0.058398."""
+        assert format_cost_usd(Decimal("0.058398")) == "$0.06"
+
+    def test_measured_openai_turn(self):
+        assert format_cost_usd(Decimal("0.05663125")) == "$0.06"
+
+    def test_measured_haiku_turn(self):
+        assert format_cost_usd(Decimal("0.01453525")) == "$0.01"
+
+    def test_measured_sonnet_turn(self):
+        assert format_cost_usd(Decimal("0.00646185")) == "$0.01"
+
+    def test_measured_gemini_turn(self):
+        assert format_cost_usd(Decimal("0.005046")) == "$0.01"
+
+    def test_multi_dollar_session_total(self):
+        assert format_cost_usd(Decimal("5.10")) == "$5.10"
+        assert format_cost_usd(Decimal("12.3456")) == "$12.35"
+        assert format_cost_usd(Decimal("123.4567")) == "$123.46"
+        assert format_cost_usd(Decimal("1234.5678")) == "$1234.57"
+
+    def test_no_raw_precision_leaks_into_the_display(self):
+        """Whatever the Decimal carries, the rendered string is always exactly
+        two decimal places (or the sub-cent marker)."""
+        for value in ["0.058398", "0.00646185", "1.00500104", "12.3456"]:
+            shown = format_cost_usd(Decimal(value))
+            assert shown.startswith("$")
+            assert len(shown.split(".")[1]) == 2, f"{value} rendered as {shown}"
+
+
+class TestFormatCostUsdNeverClaimsFree:
+    """A real, nonzero cost must never render as "$0.00" or "?".
+
+    In this module's vocabulary "$0.00" means known-to-be-free and "?" means
+    unknown.  A genuine sub-half-cent turn rendering as "$0.00" would be a
+    silent lie about a real charge.
+    """
+
+    def test_measured_sub_half_cent_turn_is_not_shown_as_free(self):
+        """$0.00171 is a REAL measured turn.  Naive cent rounding gives
+        "$0.00" — reads as free.  It must not."""
+        shown = format_cost_usd(Decimal("0.00171"))
+        assert shown == "<$0.01"
+        assert shown != "$0.00"
+
+    def test_measured_sub_cent_turn_that_does_round_up(self):
+        """$0.00636 rounds to a real cent — no marker needed."""
+        assert format_cost_usd(Decimal("0.00636")) == "$0.01"
+
+    def test_half_cent_boundary_rounds_up_not_to_zero(self):
+        """Exactly $0.005 must round up.  Python's default banker's rounding
+        would send it to "$0.00" and misreport a real cost as free."""
+        assert format_cost_usd(Decimal("0.005")) == "$0.01"
+
+    def test_just_below_half_cent_uses_the_marker(self):
+        assert format_cost_usd(Decimal("0.0049999")) == "<$0.01"
+
+    def test_arbitrarily_small_positive_costs_never_read_as_free(self):
+        """The property the measured value is an example of: across every
+        magnitude a real cost can take, a positive value never renders as
+        "$0.00" (free) or "?" (unknown)."""
+        values = [
+            Decimal("0.00000001"),
+            Decimal("0.0000123"),
+            Decimal("0.00171"),
+            Decimal("0.0043"),
+            Decimal("0.0049999999"),
+            Decimal("0.005"),
+            Decimal("0.005046"),
+            Decimal("0.00646185"),
+            Decimal("0.01453525"),
+            Decimal("0.05663125"),
+            Decimal("0.999"),
+            Decimal("5.10"),
+            Decimal("1234.5678"),
+            Decimal("1e-400"),
+        ]
+        for value in values:
+            shown = format_cost_usd(value)
+            assert shown not in ("$0.00", "?"), (
+                f"nonzero {value} rendered as {shown} — reads as free/unknown"
+            )
+
+    def test_marker_is_compact(self):
+        """This renders on every single turn — it must not be a sentence."""
+        assert format_cost_usd(Decimal("0.00171")) == "<$0.01"
+        assert len(format_cost_usd(Decimal("0.00171"))) <= 6
+
+    def test_genuinely_zero_still_reads_as_free(self):
+        """The marker must not swallow the known-free case."""
+        assert format_cost_usd(Decimal("0")) == "$0.00"
+        assert format_cost_usd(Decimal("0.00")) == "$0.00"
+        assert format_cost_usd("0") == "$0.00"
+
+    def test_absent_and_invalid_behavior_is_unchanged(self):
+        assert format_cost_usd(None) == "?"
+        assert format_cost_usd("not-a-number") == "?"
+        assert format_cost_usd(Decimal("-0.5")) == "?"
+
+    def test_absurd_magnitudes_cannot_break_rendering(self):
+        """The footer must always render, whatever lands in the event dict."""
+        assert format_cost_usd(Decimal("1e-400")) == "<$0.01"
+        assert format_cost_usd(Decimal("1e400")).startswith("$1")
 
 
 class TestSumCostUsd:

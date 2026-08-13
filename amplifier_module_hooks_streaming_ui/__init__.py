@@ -7,12 +7,11 @@ Display streaming LLM output (thinking blocks, tool calls, and token usage) to c
 __amplifier_module_type__ = "hook"
 
 import logging
-import math
 import re
 import sys
 import time
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from amplifier_core.models import HookResult
@@ -241,6 +240,11 @@ async def mount(coordinator: Any, config: dict[str, Any]) -> None:
     coordinator.hooks.register(
         "llm:response", hooks.handle_llm_response, name="streaming-ui-llm-response"
     )
+    coordinator.hooks.register(
+        "provider:resolve",
+        hooks.handle_provider_resolve,
+        name="streaming-ui-provider-resolve",
+    )
     if show_token_usage:
         _cost_handler, _cost_state = _make_cost_handler(coordinator, hooks=hooks)
         coordinator.hooks.register(
@@ -368,6 +372,15 @@ class StreamingUIHooks:
         self.overlay_active = overlay_active
         self.thinking_blocks: dict[int, dict[str, Any]] = {}
         self.last_llm_info: dict | None = None
+        # Most recent provider:resolve event whose scope was "conversation" --
+        # i.e. how the orchestrator picked the provider for the user's visible
+        # turn (as opposed to internal utility calls, e.g. scope=goal_utility).
+        # None means "no such event has ever been observed" (older
+        # orchestrators that don't emit provider:resolve at all, or simply no
+        # resolution yet). None is a distinct, honest state from "not pinned"
+        # -- the footer must never assert a pin status it doesn't actually
+        # know. See handle_provider_resolve and the token-usage header below.
+        self._last_conversation_resolve: dict[str, Any] | None = None
         # Deferred display state (overlay-active path only):
         # When overlay is on and the final response is a text block, Token Usage
         # and the turn cost line are stashed here instead of printed inline on
@@ -459,6 +472,36 @@ class StreamingUIHooks:
         # render_end was never emitted.
         self._deferred_usage = None
         self._deferred_cost = None
+        return HookResult(action="continue")
+
+    async def handle_provider_resolve(
+        self, _event: str, data: dict[str, Any]
+    ) -> HookResult:
+        """Observe how the orchestrator picked the provider for a turn.
+
+        Pure observer of provider:resolve -- never queries a pin control
+        surface, so this works with any orchestrator that reports a
+        selection `basis` on this event, with zero coupling to how (or
+        whether) pinning is implemented.
+
+        Only "conversation" scope describes the user's visible turn; other
+        scopes (e.g. "goal_utility") are internal utility calls and must be
+        ignored here so they can never influence the footer.
+
+        Args:
+            _event: Event name (provider:resolve) - unused
+            data: Event data containing provider, model, basis, scope
+
+        Returns:
+            HookResult with action="continue" (always -- this hook never
+            blocks or modifies the turn; a malformed payload must not break
+            footer rendering, so any error is swallowed defensively)
+        """
+        try:
+            if data.get("scope") == "conversation":
+                self._last_conversation_resolve = data
+        except Exception:
+            logger.debug("Ignoring malformed provider:resolve payload", exc_info=True)
         return HookResult(action="continue")
 
     def _parse_agent_from_session_id(self, session_id: str | None) -> str | None:
@@ -764,7 +807,22 @@ class StreamingUIHooks:
                 # Format duration as seconds with 1 decimal
                 duration_str = f" [{duration_ms / 1000:.1f}s]" if duration_ms else ""
 
-                header = f"📊 Token Usage ({provider}/{model}){duration_str}"
+                # Honest-absence marker: only assert "pinned" when a
+                # provider:resolve event was actually observed for this
+                # conversation turn and its basis was "pinned". No event seen
+                # (older orchestrator, or scope never resolved) -> no marker.
+                # A "priority" (or any other) basis -> no marker either.
+                # Never render a "not pinned"/"auto" label from missing data.
+                pin_marker = ""
+                if (
+                    self._last_conversation_resolve is not None
+                    and self._last_conversation_resolve.get("basis") == "pinned"
+                ):
+                    pin_marker = " · 📌 pinned"
+
+                header = (
+                    f"📊 Token Usage ({provider}/{model}{pin_marker}){duration_str}"
+                )
             else:
                 header = "📊 Token Usage"
 
@@ -1122,13 +1180,43 @@ def _flatten_reasoning_block(block: dict[str, Any]) -> str:
     return "\n".join(fragment for fragment in fragments if fragment)
 
 
-def format_cost_usd(cost: Decimal | str | None) -> str:
-    """Format cost for terminal display.
+# Cost display policy: money looks like money — nearest cent, two decimal
+# places, always.  This is a DISPLAY rule only.  The underlying cost_usd values
+# and every accumulation over them stay full-precision Decimal; rounding happens
+# once, here, at the moment of rendering.
+_CENT = Decimal("0.01")
 
-    None  → "?"       (no rate data — never show $0.00 for unknown)
-    0     → "$0.00"   (known-free)
-    ≥0.01 → "$X.XX"   (2 decimal places, e.g. "$0.09")
-    <0.01 → 2 significant figures, e.g. "$0.0064" for $0.00639785
+# The one exception, and the reason this isn't just f"${cost:.2f}": a real,
+# nonzero cost must never render as "$0.00".  In this module's vocabulary
+# "$0.00" means known-to-be-free and "?" means unknown, so a genuine
+# sub-half-cent turn (measured: $0.00171) rendering as "$0.00" would be a
+# silent lie.  Such values render as this honest upper bound instead.
+_BELOW_CENT = "<$0.01"
+
+
+def format_cost_usd(cost: Decimal | str | None) -> str:
+    """Format cost for terminal display, rounded to the nearest cent.
+
+    None → "?"       (no rate data — never show $0.00 for unknown)
+    0    → "$0.00"   (known-free)
+    else → "$X.XX", rounded half-up to the nearest cent...
+    ...except a nonzero cost that would round to zero → "<$0.01"
+
+    Worked examples across the range that actually occurs::
+
+        0.00171     -> "<$0.01"   (real, but under half a cent — NOT "$0.00")
+        0.005046    -> "$0.01"
+        0.00636     -> "$0.01"
+        0.00646185  -> "$0.01"
+        0.01453525  -> "$0.01"
+        0.05663125  -> "$0.06"
+        0.058398    -> "$0.06"
+        5.10        -> "$5.10"    (session total)
+        12.3456     -> "$12.35"
+
+    Rounding is ROUND_HALF_UP (the money convention) rather than Python's
+    default banker's rounding, so a true $0.005 shows as "$0.01" — banker's
+    rounding would send it to "$0.00" and misreport a real cost as free.
 
     Accepts Decimal or str — cost_usd values travel as strings through event
     dicts and a direct str call must not silently produce "?".
@@ -1144,17 +1232,20 @@ def format_cost_usd(cost: Decimal | str | None) -> str:
         return "$0.00"
     if cost < Decimal("0"):
         return "?"  # edge case: negative delta from contribution accounting
-    if cost >= Decimal("0.01"):
+
+    try:
+        cents = cost.quantize(_CENT, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        # Magnitude too large to quantize within Decimal's working precision.
+        # Unreachable for real costs; degrade to plain 2dp rather than raise,
+        # because the footer must always render.
         return f"${cost:.2f}"
-    # Sub-cent: 2 significant figures. Do not use Decimal.as_tuple().exponent here —
-    # intermediate Decimal arithmetic (e.g. tokens * rate / 1_000_000) stores many
-    # trailing decimal places that would produce $0.000030000 instead of $0.00003.
-    exp_floor = math.floor(math.log10(float(cost)))  # e.g. -3 for 0.0064, -4 for 0.0001
-    decimal_places = -exp_floor + 1  # 2 sig figs
-    result = f"${cost:.{decimal_places}f}"
-    # Strip trailing zeros from computed Decimal precision (e.g. "$0.00400" → "$0.004").
-    # Never strips past the decimal point.
-    return result.rstrip("0") or "$0.00"
+
+    if cents == 0:
+        # Positive, but rounds to zero cents.  Never claim free.
+        return _BELOW_CENT
+
+    return f"${cents:f}"  # quantize fixed the exponent, so this is exactly 2dp
 
 
 # Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
