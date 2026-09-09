@@ -11,6 +11,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
@@ -27,6 +28,11 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 logger = logging.getLogger(__name__)
+
+
+def format_local_timestamp() -> str:
+    """Return the local completion time in a concise, unambiguous form."""
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
 
 # ─── THROTTLE/COALESCE spike (revertable, display-only) ─────────────────────
@@ -820,11 +826,10 @@ class StreamingUIHooks:
                 ):
                     pin_marker = " · 📌 pinned"
 
-                header = (
-                    f"📊 Token Usage ({provider}/{model}{pin_marker}){duration_str}"
-                )
+                header = f"📊 Token Usage ({provider}/{model}{pin_marker}){duration_str}"
             else:
                 header = "📊 Token Usage"
+            header = f"{header} · {format_local_timestamp()}"
 
             # cost_usd may arrive as Decimal (from Pydantic model fields) or str
             # (from providers that serialize before emitting). Decimal(str(cost_raw))

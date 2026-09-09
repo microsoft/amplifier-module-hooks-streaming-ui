@@ -643,11 +643,17 @@ class TestTokenUsageHeaderWithModelInfo:
             "usage": {"input_tokens": 100, "output_tokens": 50},
         }
 
-        await hooks.handle_content_block_end("content_block:end", data)
+        with patch(
+            "amplifier_module_hooks_streaming_ui.format_local_timestamp",
+            return_value="2026-09-09 11:30 UTC",
+        ):
+            await hooks.handle_content_block_end("content_block:end", data)
 
         captured = capsys.readouterr()
-        # Should include provider/model and duration in header
-        assert "📊 Token Usage (anthropic/claude-3-sonnet) [1.5s]" in captured.out
+        assert (
+            "📊 Token Usage (anthropic/claude-3-sonnet) "
+            "[1.5s] · 2026-09-09 11:30 UTC" in captured.out
+        )
 
     @pytest.mark.asyncio
     async def test_token_usage_header_without_duration(self, capsys):
