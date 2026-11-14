@@ -182,7 +182,47 @@ class TestSumCostUsd:
 
     def test_mixed_none_and_values(self):
         contributions = [{"cost_usd": Decimal("0.03")}, {"cost_usd": None}]
-        assert _sum_cost_usd(contributions) == Decimal("0.03")
+        assert _sum_cost_usd(contributions) is None
+
+    @pytest.mark.parametrize(
+        ("contributions", "expected"),
+        [
+            ([None], None),
+            ([None, {"cost_usd": "0"}], Decimal("0")),
+            ([{"cost_usd": "0.03"}, {"cost_usd": "0.05"}], Decimal("0.08")),
+            ([{"cost_usd": None}, {"cost_usd": "0.03"}], None),
+            ([{"cost_usd": None, "known_subtotal_usd": "2", "complete": False},
+              {"cost_usd": "0.03"}], None),
+            ([{"cost_usd": "2", "complete": False}], None),
+        ],
+    )
+    def test_contribution_completeness(self, contributions, expected):
+        assert _sum_cost_usd(contributions) == expected
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["bad", "NaN", "sNaN", "Infinity", "-Infinity", "-0.01", 0.1, True, {}, []],
+    )
+    def test_malformed_cost_is_unknown(self, bad):
+        assert _sum_cost_usd([{"cost_usd": "0.03"}, {"cost_usd": bad}]) is None
+        assert format_cost_usd(bad) == "?"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cost", [None, "NaN", "Infinity", "invalid", "0", "0.03"])
+async def test_response_usage_always_shows_cost_status(capsys, cost):
+    from amplifier_module_hooks_streaming_ui import StreamingUIHooks
+
+    hooks = StreamingUIHooks(
+        show_thinking=False, show_tool_lines=5, show_token_usage=True,
+    )
+    await hooks.handle_content_block_end("content_block:end", {
+        "block_index": 0,
+        "total_blocks": 1,
+        "block": {"type": "text", "text": "Hello"},
+        "usage": {"input_tokens": 100, "output_tokens": 50, "cost_usd": cost},
+    })
+    assert f"Cost: {format_cost_usd(cost)}" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -612,3 +652,118 @@ async def test_mount_registers_prompt_submit_cost_seed():
 
     assert "prompt:submit" in registered_hooks
     assert "streaming-ui-cost-seed" in registered_hooks["prompt:submit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial",
+    [
+        [{"cost_usd": None}],
+        [{"cost_usd": None, "known_subtotal_usd": "5.00", "complete": False}],
+        [{"cost_usd": "5.00", "complete": False}],
+    ],
+)
+async def test_unknown_history_is_not_a_fresh_baseline(capsys, initial):
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler, _make_cost_seed_handler,
+    )
+
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=initial)
+    complete, state = _make_cost_handler(coordinator)
+    seed = _make_cost_seed_handler(coordinator, state)
+    await seed("prompt:submit", {})
+    assert state["baseline_known"] is False
+    assert state["seeded"] is True
+    # Even if a later collection becomes exact, it cannot establish the missing
+    # pre-turn baseline retroactively.
+    coordinator.collect_contributions.return_value = [{"cost_usd": "5.10"}]
+    await seed("prompt:submit", {})  # Must not re-seed an unknown first baseline.
+    assert state["prev_total"] is None
+    await complete("orchestrator:complete", {})
+    out = capsys.readouterr().out
+    assert "Turn: ?" in out
+    assert "Session: $5.10" in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        [{"cost_usd": "5.00"}, {"cost_usd": None}],
+        [{"cost_usd": None}, {"cost_usd": "5.00"}],
+        [{"cost_usd": None}],
+        [{"cost_usd": None, "known_subtotal_usd": "5.00", "complete": False},
+         {"cost_usd": "0.1"}],
+    ],
+)
+async def test_incomplete_footer_never_displays_partial_as_total(capsys, snapshot):
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=snapshot)
+    complete, _ = _make_cost_handler(coordinator)
+    await complete("orchestrator:complete", {})
+    out = capsys.readouterr().out
+    assert "Turn: ? | Session: ?" in out
+    assert "$5" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_at", ["seed", "complete"])
+async def test_collection_failure_invalidates_turn_baseline(capsys, failure_at):
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler, _make_cost_seed_handler,
+    )
+
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(side_effect=RuntimeError("failed"))
+    complete, state = _make_cost_handler(coordinator)
+    if failure_at == "seed":
+        await _make_cost_seed_handler(coordinator, state)("prompt:submit", {})
+    else:
+        await complete("orchestrator:complete", {})
+        capsys.readouterr()
+    coordinator.collect_contributions.side_effect = None
+    coordinator.collect_contributions.return_value = [{"cost_usd": "0.1"}]
+    await complete("orchestrator:complete", {})
+    out = capsys.readouterr().out
+    assert "Turn: ? | Session: $0.10" in out
+
+
+@pytest.mark.asyncio
+async def test_fresh_zero_and_absent_provider_are_not_unknown(capsys):
+    from amplifier_module_hooks_streaming_ui import (
+        _make_cost_handler, _make_cost_seed_handler,
+    )
+
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=[None])
+    complete, state = _make_cost_handler(coordinator)
+    await _make_cost_seed_handler(coordinator, state)("prompt:submit", {})
+    await complete("orchestrator:complete", {})
+    capsys.readouterr()
+    assert state["baseline_known"] is True
+    coordinator.collect_contributions.return_value = [None, {"cost_usd": "0"}]
+    await complete("orchestrator:complete", {})
+    assert "Turn: $0.00 | Session: $0.00" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_absent_snapshot_cannot_repair_unknown_baseline(capsys):
+    from amplifier_module_hooks_streaming_ui import _make_cost_handler
+
+    coordinator = MagicMock()
+    coordinator.collect_contributions = AsyncMock(return_value=[{"cost_usd": None}])
+    complete, state = _make_cost_handler(coordinator)
+    await complete("orchestrator:complete", {})
+    coordinator.collect_contributions.return_value = [None]
+    await complete("orchestrator:complete", {})
+    capsys.readouterr()
+    assert state["baseline_known"] is False
+    coordinator.collect_contributions.return_value = [{"cost_usd": "0.1"}]
+    await complete("orchestrator:complete", {})
+    assert "Turn: ? | Session: $0.10" in capsys.readouterr().out
+    coordinator.collect_contributions.return_value = [{"cost_usd": "0.2"}]
+    await complete("orchestrator:complete", {})
+    assert "Turn: $0.10 | Session: $0.20" in capsys.readouterr().out

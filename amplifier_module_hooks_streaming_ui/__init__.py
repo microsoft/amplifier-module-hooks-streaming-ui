@@ -831,16 +831,8 @@ class StreamingUIHooks:
                 header = "📊 Token Usage"
             header = f"{header} · {format_local_timestamp()}"
 
-            # cost_usd may arrive as Decimal (from Pydantic model fields) or str
-            # (from providers that serialize before emitting). Decimal(str(cost_raw))
-            # handles both safely.
-            cost_raw = usage.get("cost_usd")
-            cost_part = ""
-            if cost_raw is not None:
-                try:
-                    cost_part = f" | Cost: {format_cost_usd(Decimal(str(cost_raw)))}"
-                except Exception:
-                    cost_part = " | Cost: ?"
+            # Missing prices are visible, not silently presented as free usage.
+            cost_part = f" | Cost: {format_cost_usd(usage.get('cost_usd'))}"
 
             # Clear last_llm_info now — the info is already embedded in `header`.
             self.last_llm_info = None
@@ -1226,13 +1218,9 @@ def format_cost_usd(cost: Decimal | str | None) -> str:
     Accepts Decimal or str — cost_usd values travel as strings through event
     dicts and a direct str call must not silently produce "?".
     """
+    cost = _cost_decimal(cost)
     if cost is None:
         return "?"
-    if isinstance(cost, str):
-        try:
-            cost = Decimal(cost)
-        except Exception:
-            return "?"
     if cost == Decimal("0"):
         return "$0.00"
     if cost < Decimal("0"):
@@ -1256,25 +1244,34 @@ def format_cost_usd(cost: Decimal | str | None) -> str:
 # Local copy of the cost-summing helper. Modules cannot depend on amplifier-foundation,
 # so this cannot be imported from amplifier_foundation (public: sum_cost_usd).
 # Keep in sync with the canonical version there: if you fix a bug here, fix it there too.
-def _sum_cost_usd(contributions: list) -> Decimal | None:
-    """Sum cost_usd from collect_contributions("session.cost") results.
+def _cost_decimal(value: Any) -> Decimal | None:
+    """Accept exact, finite, nonnegative money; never coerce a float."""
+    if isinstance(value, bool) or not isinstance(value, (Decimal, str, int)):
+        return None
+    try:
+        cost = Decimal(value)
+        return cost if cost.is_finite() and cost >= 0 else None
+    except (InvalidOperation, ValueError):
+        return None
 
-    Returns None if no cost data is present. None != Decimal("0"):
-    None means unknown (no rate data); 0 means known-free.
-    Silently skips malformed values rather than raising.
+
+def _sum_cost_usd(contributions: list) -> Decimal | None:
+    """Return an exact total only when every present contribution is known.
+
+    None means absent or incomplete data; Decimal("0") means known-free.
+    A callback returning None means no activity. Null, malformed, nonfinite,
+    negative or explicitly incomplete contributions make the total unknown.
     """
     total: Decimal | None = None
     for c in contributions:
-        if c and isinstance(c, dict):
-            cost = c.get("cost_usd")
-            if cost is not None:
-                if isinstance(cost, Decimal):
-                    total = (total or Decimal("0")) + cost
-                else:
-                    try:
-                        total = (total or Decimal("0")) + Decimal(str(cost))
-                    except Exception:
-                        pass  # malformed cost_usd value; skip and degrade gracefully
+        if c is None:
+            continue
+        if not isinstance(c, dict) or c.get("complete") is False:
+            return None
+        cost = _cost_decimal(c.get("cost_usd"))
+        if cost is None:
+            return None
+        total = (total if total is not None else Decimal("0")) + cost
     return total
 
 
@@ -2087,7 +2084,7 @@ def _make_cost_handler(coordinator, hooks=None):
     """Create the orchestrator:complete handler and its state.
 
     Returns (handler_coroutine, state_dict) so tests can inspect state.
-    The state dict has key 'prev_total'.
+    The state distinguishes an empty fresh baseline from an unknown baseline.
 
     Args:
         coordinator: Amplifier coordinator for collect_contributions.
@@ -2097,7 +2094,7 @@ def _make_cost_handler(coordinator, hooks=None):
             flushed by hooks.handle_render_end on cleanup:render_end
             (emitted by app-cli after render_message).
     """
-    state: dict[str, Decimal | None] = {"prev_total": None}
+    state = {"prev_total": None, "baseline_known": True, "seeded": False}
 
     async def _on_orchestrator_complete(event: str, data: dict):
         # Skip sub-session orchestrator completions — only the root turn fires the cost summary.
@@ -2118,20 +2115,29 @@ def _make_cost_handler(coordinator, hooks=None):
             session_total = _sum_cost_usd(contributions)
 
             prev = state["prev_total"]
-            if session_total is not None and prev is not None:
-                turn_cost = session_total - prev
-            else:
-                turn_cost = (
-                    session_total  # first turn: turn cost = session total so far
-                )
+            turn_cost = None
+            if session_total is not None and state["baseline_known"]:
+                # Only a fresh, empty baseline may stand for zero.
+                turn_cost = session_total - (prev if prev is not None else Decimal("0"))
 
+            # No activity may preserve an already-known empty baseline, but
+            # cannot repair an unknown/failed one or erase earlier known spend.
+            baseline_known = session_total is not None or (
+                state["baseline_known"]
+                and prev is None
+                and not any(c is not None for c in contributions)
+            )
             state["prev_total"] = session_total
+            state["baseline_known"] = baseline_known
 
             turn_str = format_cost_usd(turn_cost)
             session_str = format_cost_usd(session_total)
         except Exception:
             turn_str = "?"
             session_str = "?"
+            state["prev_total"] = None
+            state["baseline_known"] = False
+        state["seeded"] = True
 
         cost_line = f"\033[2m💰 Turn: {turn_str} | Session: {session_str}\033[0m"
 
@@ -2151,24 +2157,24 @@ def _make_cost_seed_handler(coordinator, state):
     """Create the prompt:submit handler that seeds the per-turn cost baseline.
 
     The orchestrator:complete cost handler reports each turn's cost as the delta
-    between the current session.cost total and state["prev_total"].  On the very
-    first turn of a process prev_total is None, so it falls back to reporting the
-    whole session total as the turn cost.  That fallback is correct for a *fresh*
-    session (nothing came before) but wrong for a *resumed* one: app-cli restores
+    between the current session.cost total and a known baseline. Only a fresh
+    session (nothing came before) may use zero as that baseline. App-cli restores
     prior spend by registering a history:<session_id> contributor on session.cost
     before the first turn runs, so the first post-resume total already includes
     everything spent in previous runs.  Without a baseline the first line after a
     resume shows Turn == Session (e.g. "Turn: $5.10 | Session: $5.10").
 
     This handler captures the pre-turn session.cost snapshot into
-    state["prev_total"] once, at the start of the first turn this process handles,
+    state once, at the start of the first turn this process handles,
     so the first orchestrator:complete computes a correct delta.  Turn 2+ baselines
     are maintained by the complete handler itself, so this only ever acts once.
+    Unknown or failed collection is not a fresh baseline and cannot yield a
+    known first-turn delta, even if a later total becomes known.
     """
 
     async def _on_prompt_submit(event: str, data: dict):
         # Only seed the first turn; after that the complete handler owns prev_total.
-        if state["prev_total"] is not None:
+        if state["seeded"]:
             return HookResult(action="continue")
         # Mirror the complete handler's sub-session guard: a sub-session prompt
         # must never seed the root baseline.  (Sub-sessions carry a session_id
@@ -2181,9 +2187,14 @@ def _make_cost_seed_handler(coordinator, state):
         try:
             contributions = await coordinator.collect_contributions("session.cost")
             state["prev_total"] = _sum_cost_usd(contributions)
+            state["baseline_known"] = (
+                state["prev_total"] is not None
+                or not any(c is not None for c in contributions)
+            )
         except Exception:
-            # Baseline seeding is best-effort display polish; never disrupt the turn.
-            pass
+            # Failed collection is unknown, not a fresh zero baseline.
+            state["baseline_known"] = False
+        state["seeded"] = True
         return HookResult(action="continue")
 
     return _on_prompt_submit

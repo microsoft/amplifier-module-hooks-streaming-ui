@@ -63,6 +63,14 @@ show_token_usage = true      # Display token usage after each turn (default: tru
 
 ## Display Format
 
+Cost displays reserve `$0.00` for a known zero and use `?` for unavailable
+prices. A session total is unknown if any present `session.cost` contribution
+has null/invalid cost or `complete: false`; `known_subtotal_usd` is never shown
+as an exact total. A callback returning `None` before activity is not an unknown
+charge. Turn deltas require a known baseline; missing or failed historical
+pricing cannot become a known turn cost. This display does not recompute prices
+or rewrite history.
+
 ### Thinking Blocks
 
 ```
