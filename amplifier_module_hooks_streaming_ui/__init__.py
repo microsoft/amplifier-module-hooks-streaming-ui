@@ -2120,8 +2120,15 @@ def _make_cost_handler(coordinator, hooks=None):
                 # Only a fresh, empty baseline may stand for zero.
                 turn_cost = session_total - (prev if prev is not None else Decimal("0"))
 
+            # No activity may preserve an already-known empty baseline, but
+            # cannot repair an unknown/failed one or erase earlier known spend.
+            baseline_known = session_total is not None or (
+                state["baseline_known"]
+                and prev is None
+                and not any(c is not None for c in contributions)
+            )
             state["prev_total"] = session_total
-            state["baseline_known"] = session_total is not None
+            state["baseline_known"] = baseline_known
 
             turn_str = format_cost_usd(turn_cost)
             session_str = format_cost_usd(session_total)
