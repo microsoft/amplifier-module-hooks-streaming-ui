@@ -787,8 +787,8 @@ class TestTokenUsageCostDisplay:
         assert "Total: 1,500" in captured.out
 
     @pytest.mark.asyncio
-    async def test_token_usage_omits_cost_when_absent(self, capsys):
-        """When cost_usd is absent, the Token Usage line does not show 'Cost:'."""
+    async def test_token_usage_marks_cost_unknown_when_absent(self, capsys):
+        """Absent pricing is visible rather than silently omitted."""
         hooks = StreamingUIHooks(
             show_thinking=True, show_tool_lines=5, show_token_usage=True
         )
@@ -807,13 +807,11 @@ class TestTokenUsageCostDisplay:
         await hooks.handle_content_block_end("content_block:end", data)
 
         captured = capsys.readouterr()
-        assert "Cost:" not in captured.out, (
-            f"Cost: should not appear when cost_usd is absent, got: {captured.out}"
-        )
+        assert "Cost: ?" in captured.out
 
     @pytest.mark.asyncio
-    async def test_token_usage_omits_cost_when_none(self, capsys):
-        """When cost_usd is explicitly None, the Token Usage line does not show 'Cost:'."""
+    async def test_token_usage_marks_cost_unknown_when_none(self, capsys):
+        """Explicitly unknown pricing is visible rather than silently omitted."""
         hooks = StreamingUIHooks(
             show_thinking=True, show_tool_lines=5, show_token_usage=True
         )
@@ -832,9 +830,7 @@ class TestTokenUsageCostDisplay:
         await hooks.handle_content_block_end("content_block:end", data)
 
         captured = capsys.readouterr()
-        assert "Cost:" not in captured.out, (
-            f"Cost: should not appear when cost_usd is None, got: {captured.out}"
-        )
+        assert "Cost: ?" in captured.out
 
 
 # ---------------------------------------------------------------------------
